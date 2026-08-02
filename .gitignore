@@ -1,0 +1,17 @@
+# OS / editor artifacts
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+
+# knitting artifacts
+*.html
+!01_experiment/*.html
+
+# notebook outputs (regenerated on knit)
+02_behavioural/*.rds
+02_behavioural/*.png
+02_behavioural/*.txt
+
+# anonymization keys must never enter the repository
+anonymization_key*

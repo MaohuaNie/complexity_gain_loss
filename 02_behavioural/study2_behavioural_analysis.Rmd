@@ -1,0 +1,2573 @@
+---
+title: "Study 2 — Behavioural Analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r}
+# ============================================================================
+# study2_behavioural_analysis.Rmd — model-free + regression analyses, Study 2
+#
+# Aim:      Main behavioural analysis for Study 2 (risky vs sure choices in
+#           gain and loss domains), organised to mirror the manuscript:
+#           sample / preregistered exclusions and descriptives, complex-option
+#           and risky-option choice t-tests, response-time analyses, the
+#           Bayesian logistic mixed-effects regression (brms), subjective
+#           complexity / cognitive-uncertainty ratings, cognitive-ability
+#           correlations, high-EV-difference trial accuracy, the Appendix B
+#           complex-role test, and the manuscript summary figures.
+# Inputs:   ../data/study2/merged_data_study2.csv.gz (anonymised trial-level
+#           pre-exclusion data; one row per jsPsych event)
+# Outputs:  figure .png files (individual panels plus the manuscript
+#           assemblies summary_analysis_1_update.png and
+#           summary_analysis_2.png) and the brms model cache
+#           m_brm_study2.rds, written to the working directory
+#           (02_behavioural/)
+# Exclusions applied here:
+#   - Comprehension questions: participants with more than 8 total attempts
+#     across the four comprehension ("design") questions are excluded.
+#   - RT cleaning (test trials, practice excluded): trials with RT < 1 s or
+#     RT > 30 s are removed; then, within participant x block, trials flagged
+#     as beyond median +/- 3 SD are removed.
+#   - Minimum-trials criterion: participants with fewer than 62 (= 124/2)
+#     remaining test trials are excluded.
+# Usage:    knit or run chunks from within 02_behavioural/ so the relative
+#           input path resolves. The brms model is cached to
+#           m_brm_study2.rds after the first fit; delete that file to force
+#           a refit. No network access is required.
+# ============================================================================
+```
+
+# Setup
+
+Packages, data load, and consolidated helper functions (significance stars
+and the shared plot themes) used throughout the report.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+# Packages used throughout the analysis
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(magrittr)
+library(purrr)
+library(knitr)
+library(stringr)
+library(broom)
+library(cowplot)
+library(brms)
+library(parameters)
+```
+
+```{r load-data}
+# Load anonymised trial-level data; fread() reads the .gz directly (via R.utils)
+data <- fread("../data/study2/merged_data_study2.csv.gz")
+```
+
+```{r helpers}
+# Shared helpers used throughout the notebook.
+
+# p-value -> significance stars
+p_to_stars <- function(p){
+  dplyr::case_when(
+    is.na(p) ~ "",
+    p < .001 ~ "***",
+    p < .01  ~ "**",
+    p < .05  ~ "*",
+    TRUE     ~ "ns"
+  )
+}
+
+# Publication-style theme for the bar/jitter and correlation panels
+theme_pub <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      axis.title         = element_text(face = "bold"),
+      axis.text          = element_text(color = "black"),
+      panel.border       = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      plot.title         = element_text(face = "bold", hjust = 0.5),
+      axis.line          = element_line(color = "black"),
+      legend.position    = "none"
+    )
+}
+
+# Variant used by the subjective-rating panels (legend on top, no axis line)
+theme_pub_top <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      axis.title         = element_text(face = "bold"),
+      axis.text          = element_text(color = "black"),
+      panel.border       = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      plot.title         = element_text(face = "bold", hjust = 0.5),
+      legend.position    = "top"
+    )
+}
+
+# Strip CSV-style quoting from JSON survey responses
+clean_json <- function(x) {
+  x <- gsub('^"|"$', "", x)             # strip outer quotes
+  x <- gsub('""', '"', x, fixed = TRUE) # unescape CSV-style quotes
+  x
+}
+```
+
+# Preregistered exclusions
+
+Participants answered four comprehension ("design") questions; anyone who
+needed more than 8 total attempts to pass them is excluded. Response-time
+cleaning then removes trials with RT < 1 s or > 30 s and, within
+participant x block, trials beyond median +/- 3 SD; participants with fewer
+than 62 (= 124/2) remaining test trials are excluded.
+
+```{r comprehension-exclusion}
+# Count comprehension-question attempts per participant and apply the
+# preregistered exclusion (> 8 attempts across the four questions)
+data_filtered <- data %>%
+  group_by(prolific_pid) %>%
+  mutate(attempts_to_pass_four_questions = sum(trial_type_label == "question", na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(attempts_to_pass_four_questions <= 8)
+```
+
+```{r rt-cleaning-absolute}
+# Keep main test trials (practice excluded), convert RT from ms to seconds,
+# and flag absolute outliers (RT < 1 s or RT > 30 s)
+cleaned_RT_data <- data_filtered %>%
+  filter(trial_type_label == 'test' & test_part != 'prac') %>%
+  mutate(rt = as.numeric(rt_trial/1000))
+
+cleaned_RT_data <- cleaned_RT_data %>%
+  mutate(
+    is_outlier1 = rt < 1 | rt > 30
+  )
+```
+
+```{r rt-cleaning-median-sd}
+# Within participant x block, flag trials beyond median +/- 3 SD and drop them
+cleaned_RT_data <- cleaned_RT_data %>%
+  filter(!is_outlier1 ) %>%
+  group_by(prolific_pid, test_part) %>%
+  mutate(
+    median_rt = median(rt),
+    sd_rt = sd(rt),
+    is_outlier2 = rt < (median_rt - 3 * sd_rt) | rt > (median_rt + 3 * sd_rt)
+  )
+
+cleaned_RT_data <- cleaned_RT_data %>%
+  filter(!is_outlier2)
+```
+
+```{r min-trials-criterion}
+# Minimum-trials criterion: keep participants with at least 62 (= 124/2)
+# clean test trials
+trial_counts <- cleaned_RT_data %>%
+  group_by(prolific_pid) %>%
+  dplyr::summarize(trials = n())
+
+
+participants_to_keep <- trial_counts %>%
+  filter(trials >= 124/2) %>%
+  select(prolific_pid)
+
+
+cleaned_RT_data <- cleaned_RT_data %>%
+  filter(prolific_pid %in% participants_to_keep$prolific_pid)
+```
+
+```{r exclusion-flow-table}
+# Exclusion flow (150 recruited -> 10 comprehension-excluded ->
+# 5 RT-excluded -> N = 135)
+n_recruited  <- dplyr::n_distinct(data$prolific_pid)
+n_after_comp <- dplyr::n_distinct(data_filtered$prolific_pid)
+n_final      <- nrow(participants_to_keep)
+
+tibble(
+  Stage = c(
+    "Recruited",
+    "Excluded: comprehension questions (> 8 attempts)",
+    "Excluded: response-time criteria",
+    "Final sample"
+  ),
+  N = c(
+    n_recruited,
+    n_recruited - n_after_comp,
+    n_after_comp - n_final,
+    n_final
+  )
+) %>%
+  kable(caption = "Exclusion flow")
+```
+
+```{r analysis-dataset}
+# Analysis dataset used by all choice analyses below.
+# Recode responses so real_response reflects the option actually chosen
+# (screen sides were counterbalanced via risk_index), then code whether the
+# complex option was chosen on each trial
+df_test1 <- cleaned_RT_data %>%
+  filter(trial_type_label == "test" & skew != "catch") %>%
+  mutate(real_response = case_when(
+    risk_index == 1 & response == "f" ~ "f",
+    risk_index == 1 & response == "j" ~ "j",
+    risk_index == -1 & response == "f" ~ "j",
+    risk_index == -1 & response == "j" ~ "f"
+  )) %>%
+  mutate(
+    complex_choice = case_when(
+      complexity_option == "A" & real_response == "f" ~ 1L,
+      complexity_option == "B" & real_response == "j" ~ 1L,
+      TRUE ~ 0L
+    )
+  )
+```
+
+# Sample descriptives
+
+In total, 10 participants were excluded based on the preregistered
+design-question accuracy criterion, and an additional 5 participants were
+excluded due to response-time criteria. The final sample for analysis
+consisted of 135 participants (mean age = 39.32 years, SD = 10.19,
+range = 19-60), of whom 44.4% were female (n = 60) and 55.6% were male
+(n = 75).
+
+## Demographics
+
+```{r demographics-parse}
+# Parse demographics (age, gender, education) and free-text feedback from
+# the JSON-encoded survey responses
+demo_table <- data %>%
+  filter(trial_type_label == 'demo')
+
+demo_clean <- demo_table %>%
+  mutate(
+    parsed = map(response, ~{
+      txt <- clean_json(.x)
+      tryCatch(fromJSON(txt), error = function(e) list())
+    }),
+    Age       = map_chr(parsed, ~pluck(.x, "Age",       .default = NA_character_)),
+    Gender    = map_chr(parsed, ~pluck(.x, "Q0",        .default = NA_character_)),
+    Education = map_chr(parsed, ~pluck(.x, "Q1",        .default = NA_character_)),
+    Feedback  = map_chr(parsed, ~pluck(.x, "feedback",  .default = NA_character_))
+  ) %>%
+  select(prolific_pid, Age, Gender, Education, Feedback)
+
+# make Age numeric
+demo_clean <- demo_clean %>%
+  mutate(Age = suppressWarnings(as.numeric(Age)))
+
+# one row per participant (if duplicated, keep first non-NA)
+demo_final <- demo_clean %>%
+  group_by(prolific_pid) %>%
+  summarise(
+    Age       = suppressWarnings(as.numeric(na.omit(Age)[1])),
+    Gender    = na.omit(Gender)[1]    %||% NA_character_,
+    Education = na.omit(Education)[1] %||% NA_character_,
+    Feedback  = na.omit(Feedback)[1]  %||% NA_character_,
+    .groups = "drop"
+  )
+```
+
+```{r demographics-summary}
+# Sample demographics after all exclusions
+demo_final_filtered <- demo_final %>%
+  filter(prolific_pid %in% participants_to_keep$prolific_pid)
+
+demo_summary <- demo_final_filtered %>%
+  summarise(
+    n = n(),
+    mean_age = mean(Age, na.rm = TRUE),
+    sd_age = sd(Age, na.rm = TRUE),
+    min_age = min(Age, na.rm = TRUE),
+    max_age = max(Age, na.rm = TRUE),
+    female_n = sum(Gender == "Female", na.rm = TRUE),
+    male_n = sum(Gender == "Male", na.rm = TRUE),
+    other_n = sum(!(Gender %in% c("Male", "Female"))),
+    female_pct = round(100 * female_n / n, 1),
+    male_pct   = round(100 * male_n / n, 1),
+    other_pct  = round(100 * other_n / n, 1)
+  )
+
+demo_summary %>%
+  kable(digits = 2, caption = "Demographics of the final sample (N = 135)")
+```
+
+## Comprehension-question attempts
+
+```{r comprehension-attempts}
+cleaned_RT_data %>%
+  ungroup() %>%
+  summarise(mean_attempt = mean(attempts_to_pass_four_questions)) %>%
+  kable(digits = 2,
+        caption = "Mean comprehension-question attempts (final sample)")
+```
+
+## Median response times by domain
+
+Overall median RTs per domain and the paired comparison of per-participant
+median RTs (losses vs gains). This domain RT comparison is reported in the
+Discussion (alternative explanations).
+
+```{r rt-by-domain}
+df_rt_gain_loss_diff <- df_test1 %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  group_by(subject, test_part) %>%
+  summarise(median_rt = median(rt), .groups = "drop")
+
+df_rt_gain_loss_diff_median <- df_test1 %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  group_by( test_part) %>%
+  summarise(median_rt = median(rt),
+            sd_rt = sd(rt), .groups = "drop")
+
+df_rt_gain_loss_diff_median %>%
+  kable(digits = 2, caption = "Median RT (s) per domain")
+
+df_rt_gain_loss_wide <- df_rt_gain_loss_diff %>%
+  tidyr::pivot_wider(
+    names_from  = test_part,
+    values_from = median_rt
+  )
+
+t_rt_domain <- t.test(
+  df_rt_gain_loss_wide$Loss,
+  df_rt_gain_loss_wide$Gain,
+  paired = TRUE
+)
+
+tidy(t_rt_domain) %>%
+  kable(digits = 3,
+        caption = "Paired t-test: per-participant median RT, Loss vs Gain")
+```
+
+## Bonus payments
+
+```{r bonus-summary}
+bonus_summary <- data %>%
+  filter(!is.na(total_bonus)) %>%  # Keep rows where total_bonus is not NA
+  distinct(prolific_pid, total_bonus)
+
+bonus_summary %>%
+  summarise(
+    n = n(),
+    mean_bonus_gbp = mean(total_bonus),
+    min_bonus_gbp  = min(total_bonus),
+    max_bonus_gbp  = max(total_bonus)
+  ) %>%
+  kable(digits = 2, caption = "Bonus payments (GBP)")
+```
+
+## Completion time
+
+```{r completion-time}
+# Completion time per participant = final cumulative time stamp of their
+# session (time_elapsed is cumulative within a session, in ms)
+completion <- data %>%
+  filter(prolific_pid %in% participants_to_keep$prolific_pid) %>%
+  group_by(prolific_pid) %>%
+  summarise(minutes = max(time_elapsed, na.rm = TRUE) / 1000 / 60,
+            .groups = "drop")
+
+kable(
+  tibble(`Median completion time (min)` = median(completion$minutes)),
+  digits = 1,
+  caption = "Completion time."
+)
+```
+
+# Complex-option choice
+
+Two-sided one-sample t-tests comparing the mean choice proportion of complex
+options against the 50% benchmark, separately for the gain and loss
+conditions, plus the paired comparison between domains.
+
+```{r complex-choice-tests}
+complex_choice_summary_individual <- df_test1 %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  group_by(prolific_pid, test_part) %>%
+  summarise(
+    n_trials = n(),
+    n_complex = sum(complex_choice, na.rm = TRUE),
+    prop_complex = mean(complex_choice, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+complex_choice_summary_group <-  complex_choice_summary_individual %>%
+  group_by(test_part) %>%
+  summarise(
+    mean_complex_prop = mean(prop_complex, na.rm = TRUE),
+    se = sd(prop_complex, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  mutate(
+    lower = mean_complex_prop - 1.96 * se,
+    upper = mean_complex_prop + 1.96 * se
+  )
+
+# ---------- t-tests ----------
+t_gain <- t.test(
+  complex_choice_summary_individual$prop_complex[
+    complex_choice_summary_individual$test_part == "Gain"
+  ],
+  mu = 0.5
+)
+t_loss <- t.test(
+  complex_choice_summary_individual$prop_complex[
+    complex_choice_summary_individual$test_part == "Loss"
+  ],
+  mu = 0.5
+)
+
+complex_wide <- complex_choice_summary_individual %>%
+  tidyr::pivot_wider(
+    id_cols = prolific_pid,
+    names_from = test_part,
+    values_from = prop_complex
+  )
+
+t_gain_vs_loss <- t.test(
+  complex_wide$Gain, complex_wide$Loss,
+  paired = TRUE
+)
+
+complex_choice_summary_group %>%
+  kable(digits = 4, caption = "Complex-option choice proportion by domain")
+
+# tidy summary table
+complex_t_summary <- dplyr::bind_rows(
+  broom::tidy(t_gain)         %>% dplyr::mutate(test = "Gain vs 0.5"),
+  broom::tidy(t_loss)         %>% dplyr::mutate(test = "Loss vs 0.5"),
+  broom::tidy(t_gain_vs_loss) %>% dplyr::mutate(test = "Gain vs Loss (paired)")
+)
+
+complex_t_summary %>%
+  kable(digits = 4, caption = "Complex-option choice t-tests")
+```
+
+```{r complex-choice-plot, fig.width=7, fig.height=5}
+stars_gain <- p_to_stars(t_gain$p.value)
+stars_loss <- p_to_stars(t_loss$p.value)
+stars_pair <- p_to_stars(t_gain_vs_loss$p.value)
+
+# ---------- plotting data ----------
+plot_df_points <- complex_choice_summary_individual
+plot_df_bars   <- complex_choice_summary_group
+
+plot_df_bars$test_part   <- factor(plot_df_bars$test_part,
+                                   levels = c("Gain","Loss"),
+                                   labels = c("Gains", "Losses"))
+plot_df_points$test_part <- factor(plot_df_points$test_part,
+                                   levels = c("Gain","Loss"),
+                                   labels = c("Gains", "Losses"))
+
+# ---- fixed positions for stars & bracket ----
+y_gain_star <- 0.85
+y_loss_star <- 0.85
+bracket_y   <- 0.93   # ends of the bracket
+label_y     <- 0.95  # text for Gain vs Loss
+
+# ---------- plot ----------
+plot_complex_choice <- ggplot() +
+  geom_jitter(
+    data = plot_df_points,
+    aes(x = test_part, y = prop_complex),
+    width = 0.10, height = 0,
+    alpha = 0.45, size = 2
+  ) +
+  geom_col(
+    data = plot_df_bars,
+    aes(x = test_part, y = mean_complex_prop),
+    width = 0.55,
+    fill = "grey60",
+    color = "black",
+    alpha = 0.2
+  ) +
+  geom_errorbar(
+    data = plot_df_bars,
+    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    width = 0.15,
+    linewidth = 1.3
+
+  ) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  # one-sample stars (vs .5), now clearly above dots
+  geom_text(aes(x = "Gains",  y = y_gain_star, label = stars_gain), vjust = 0, size = 6, fontface = "bold") +
+  geom_text(aes(x = "Losses", y = y_loss_star, label = stars_loss), vjust = 0, size = 6, fontface = "bold") +
+  # bracket + star for Gain vs Loss
+  geom_segment(aes(x = 1, xend = 1, y = bracket_y - 0.01, yend = bracket_y)) +
+  geom_segment(aes(x = 2, xend = 2, y = bracket_y - 0.01, yend = bracket_y)) +
+  geom_segment(aes(x = 1, xend = 2, y = bracket_y,       yend = bracket_y)) +
+  geom_text(aes(x = 1.5, y = label_y, label = stars_pair), vjust = 0, size = 6, fontface = "bold") +
+  scale_y_continuous(
+    limits = c(0, 1),              # allow a bit of space above 1
+    breaks = seq(0, 1, by = 0.25),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Domain",
+    y = "Proportion of complex-option choices",
+    title = "Complex-option choices in gain and loss domains"
+  ) +
+  theme_pub()
+
+plot_complex_choice
+
+ggsave(
+  filename = "s2_plot_complex_choice.png",
+  plot = plot_complex_choice,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+# Risky-option choice
+
+Two-sided one-sample t-tests comparing the mean choice proportion of risky
+options against the 50% benchmark, separately for the gain and loss
+conditions, plus the paired comparison between domains.
+
+```{r risky-choice-tests}
+risk_choice_summary <- df_test1 %>%
+  group_by(prolific_pid, test_part) %>%
+  summarise(
+    n_trials = n(),
+    n_risky = sum(real_response == "f", na.rm = TRUE),
+    prop_risky = mean(real_response == "f", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+risky_choice_summary_group <-  risk_choice_summary %>%
+  group_by(test_part) %>%
+  summarise(
+    mean_risky_prop = mean(prop_risky, na.rm = TRUE),
+    se = sd(prop_risky, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  mutate(
+    lower = mean_risky_prop - 1.96 * se,
+    upper = mean_risky_prop + 1.96 * se
+  )
+
+# --- One-sample (vs .5) t-tests for prop_risky ---
+t_risk_gain <- t.test(
+  risk_choice_summary$prop_risky[risk_choice_summary$test_part == "Gain"],
+  mu = 0.5, alternative = "two.sided"
+)
+
+t_risk_loss <- t.test(
+  risk_choice_summary$prop_risky[risk_choice_summary$test_part == "Loss"],
+  mu = 0.5, alternative = "two.sided"
+)
+
+# --- Paired t-test Gain vs Loss ---
+risk_wide <- risk_choice_summary %>%
+  tidyr::pivot_wider(
+    id_cols   = prolific_pid,
+    names_from = test_part,
+    values_from = prop_risky
+  )
+
+t_risk_gain_vs_loss <- t.test(
+  risk_wide$Gain, risk_wide$Loss,
+  paired = TRUE, alternative = "two.sided"
+)
+
+risky_choice_summary_group %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  kable(digits = 4, caption = "Risky-option choice proportion by domain")
+
+# tidy summary table
+risk_t_summary <- dplyr::bind_rows(
+  broom::tidy(t_risk_gain)         %>% dplyr::mutate(test = "Gain vs 0.5"),
+  broom::tidy(t_risk_loss)         %>% dplyr::mutate(test = "Loss vs 0.5"),
+  broom::tidy(t_risk_gain_vs_loss) %>% dplyr::mutate(test = "Gain vs Loss (paired)")
+)
+
+risk_t_summary %>%
+  kable(digits = 4, caption = "Risky-option choice t-tests")
+```
+
+```{r risky-choice-plot, fig.width=7, fig.height=5}
+stars_gain_r <- p_to_stars(t_risk_gain$p.value)
+stars_loss_r <- p_to_stars(t_risk_loss$p.value)
+stars_pair_r <- p_to_stars(t_risk_gain_vs_loss$p.value)
+
+# ---------- data for plotting ----------
+plot_pts_r <- risk_choice_summary %>%
+  mutate(test_part = factor(test_part,
+                            levels = c("Gain","Loss"),
+                            labels = c("Gains","Losses")))
+
+plot_bars_r <- risky_choice_summary_group %>%
+  mutate(test_part = factor(test_part,
+                            levels = c("Gain","Loss"),
+                            labels = c("Gains","Losses")))
+
+# fixed positions for stars & bracket (all above the dots/bars)
+y_gain_star_r <- 1
+y_loss_star_r <- 1
+bracket_y_r   <- 1.05
+label_y_r     <- 1.07
+
+# ---------- plot ----------
+plot_risky_choice <- ggplot() +
+  # individual participants
+  geom_jitter(
+    data = plot_pts_r,
+    aes(x = test_part, y = prop_risky),
+    width = 0.10, height = 0,
+    alpha = 0.45, size = 2
+  ) +
+  # group mean bars (semi-transparent)
+  geom_col(
+    data = plot_bars_r,
+    aes(x = test_part, y = mean_risky_prop),
+    width  = 0.55,
+    fill   = "grey60",
+    color  = "black",
+    alpha  = 0.45
+  ) +
+  # 95% CI
+  geom_errorbar(
+    data = plot_bars_r,
+    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    width = 0.12,
+    linewidth = 1.2
+  ) +
+  # reference line at 0.5
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  # one-sample stars above each bar (vs .5)
+
+geom_text(
+  aes(x = "Gains",  y = y_gain_star_r, label = stars_gain_r),
+  vjust = 0, size = 6, fontface = "bold"
+) +
+geom_text(
+  aes(x = "Losses", y = y_loss_star_r, label = stars_loss_r),
+  vjust = 0, size = 6, fontface = "bold"
+) +
+
+# bracket + star for Gain vs Loss (paired)
+geom_segment(aes(x = 1, xend = 1, y = 1.07, yend = 1.07)) +
+geom_segment(aes(x = 2, xend = 2, y = 1.07, yend = 1.07)) +
+geom_segment(aes(x = 1, xend = 2, y = 1.07, yend = 1.07)) +
+geom_text(
+  aes(x = 1.5, y = label_y_r, label = stars_pair_r),
+  vjust = 0, size = 6, fontface = "bold"
+) +
+  scale_y_continuous(
+    limits = c(0, 1.15),
+    breaks = seq(0, 1, by = 0.25),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Domain",
+    y = "Proportion of risky choices",
+    title = "Risky choices in gain and loss domains"
+  ) +
+  theme_pub()
+
+plot_risky_choice
+
+ggsave(
+  filename = "s2_plot_risky_choice.png",
+  plot = plot_risky_choice,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+# Response times
+
+## Median RT: complex vs simple choices
+
+Per-participant median RT difference (complex-chosen minus simple-chosen
+trials), tested against 0 within each domain and compared between domains.
+
+```{r rt-complex-simple-tests}
+# ---- per participant × condition × choice (complex vs simple) ----
+rt_individual <- df_test1 %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  group_by(prolific_pid, test_part, complex_choice) %>%
+  summarise(
+    median_rt = median(rt, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+# complex_choice: 1 = complex chosen, 0 = simple chosen
+rt_wide <- rt_individual %>%
+  mutate(choice_label = ifelse(complex_choice == 1, "complex", "simple")) %>%
+  select(prolific_pid, test_part, choice_label, median_rt) %>%
+  pivot_wider(
+    id_cols   = c(prolific_pid, test_part),
+    names_from = choice_label,
+    values_from = median_rt,
+    names_prefix = "median_rt_"
+  ) %>%
+  # keep only rows with both complex & simple
+  filter(!is.na(median_rt_complex), !is.na(median_rt_simple))
+
+
+# ---- per-participant RT difference (complex − simple) ----
+rt_diff <- rt_wide %>%
+  transmute(
+    prolific_pid,
+    test_part,
+    rt_diff = median_rt_complex - median_rt_simple
+  ) %>%
+  mutate(
+    test_part = factor(test_part, levels = c("Gain", "Loss"),
+                       labels = c("Gains", "Losses"))
+  )
+
+# ---- group summary for bars + 95% CI ----
+rt_diff_summary <- rt_diff %>%
+  group_by(test_part) %>%
+  summarise(
+    mean_diff = mean(rt_diff, na.rm = TRUE),
+    se        = sd(rt_diff,  na.rm = TRUE) / sqrt(n()),
+    lower     = mean_diff - 1.96 * se,
+    upper     = mean_diff + 1.96 * se,
+    .groups   = "drop"
+  )
+
+# ---- tests: one-sample vs 0 (within domain) ----
+t_gain_median <- t.test(
+  rt_diff$rt_diff[rt_diff$test_part == "Gains"],
+  mu = 0
+)
+t_loss_median <- t.test(
+  rt_diff$rt_diff[rt_diff$test_part == "Losses"],
+  mu = 0
+)
+
+# ---- paired Gain vs Loss (within-subjects) ----
+rt_diff_wide <- rt_diff %>%
+  pivot_wider(
+    id_cols = prolific_pid,
+    names_from = test_part,
+    values_from = rt_diff
+  )
+
+t_pair_median <- t.test(
+  rt_diff_wide$Gains,
+  rt_diff_wide$Losses,
+  paired = TRUE
+)
+
+# ---- tidy summary table ----
+rt_tests_summary_median <- bind_rows(
+  tidy(t_gain_median)  %>% mutate(test = "Gains vs 0",  metric = "Median RT (complex − simple)"),
+  tidy(t_loss_median)  %>% mutate(test = "Losses vs 0", metric = "Median RT (complex − simple)"),
+  tidy(t_pair_median)  %>% mutate(test = "Gains vs Losses (paired)", metric = "Median RT (complex − simple)")
+) %>%
+  select(metric, test, estimate, statistic, parameter, p.value, conf.low, conf.high)
+
+rt_tests_summary_median %>%
+  kable(digits = 4, caption = "Median RT differences: complex − simple")
+```
+
+```{r rt-complex-simple-plot, fig.width=7, fig.height=5}
+stars_gain   <- p_to_stars(t_gain_median$p.value)
+stars_loss   <- p_to_stars(t_loss_median$p.value)
+stars_pair   <- p_to_stars(t_pair_median$p.value)
+
+# ---- positions for stars and bracket ----
+rng       <- range(rt_diff_summary$upper, rt_diff_summary$lower, na.rm = TRUE)
+span      <- diff(rng)
+span      <- ifelse(span == 0, 0.1, span)  # fallback
+
+y_gain_star <- 4
+y_loss_star <- 4
+
+bracket_y   <- 4.5
+label_y     <- 4.3
+
+# ---- plot ----
+plot_rt_median_diff <- ggplot() +
+  # individual participant differences
+  geom_jitter(
+    data  = rt_diff,
+    aes(x = test_part, y = rt_diff),
+    width = 0.10, height = 0,
+    alpha = 0.45, size = 2
+  ) +
+  # group mean bars (semi-transparent)
+  geom_col(
+    data  = rt_diff_summary,
+    aes(x = test_part, y = mean_diff),
+    width = 0.55,
+    fill  = "grey60",
+    color = "black",
+    alpha = 0.45
+  ) +
+  # 95% CI
+  geom_errorbar(
+    data = rt_diff_summary,
+    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    width = 0.12,
+    linewidth = 1.2
+  ) +
+  # zero reference line
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  # stars for one-sample tests
+  geom_text(
+    aes(x = "Gains",  y = y_gain_star, label = stars_gain),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  geom_text(
+    aes(x = "Losses", y = y_loss_star, label = stars_loss),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  # bracket + star for Gain vs Loss
+  geom_segment(aes(x = 1, xend = 1, y = bracket_y - 0.01 * span, yend = bracket_y)) +
+  geom_segment(aes(x = 2, xend = 2, y = bracket_y - 0.01 * span, yend = bracket_y)) +
+  geom_segment(aes(x = 1, xend = 2, y = bracket_y,               yend = bracket_y)) +
+  geom_text(
+    aes(x = 1.5, y = 4.6, label = stars_pair),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  labs(
+    x = "Domain",
+    y = "Median RT difference (complex − simple, s)",
+    title = "Median RT differences for complex vs simple choices"
+  ) +
+  coord_cartesian(
+    ylim = c(-3, 5
+    )
+  ) +
+  theme_pub()
+
+plot_rt_median_diff
+
+ggsave(
+  filename = "s2_plot_rt_median_diff.png",
+  plot = plot_rt_median_diff,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+## Median RT: risky vs sure choices
+
+```{r rt-risky-sure-data}
+# Recode choice: risky = 1, safe = 0
+df_rt_risky <- df_test1 %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  mutate(
+    risky_choice = ifelse(real_response == "f", 1,
+                          ifelse(real_response == "j", 0, NA))
+  ) %>%
+  filter(!is.na(risky_choice))
+
+# ---- summarise median RT per participant × domain × risky/safe ----
+rt_individual_risky <- df_rt_risky %>%
+  group_by(prolific_pid, test_part, risky_choice) %>%
+  summarise(
+    median_rt = median(rt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- wide format (median_rt_risky vs median_rt_safe) ----
+rt_wide_risky <- rt_individual_risky %>%
+  mutate(choice_label = ifelse(risky_choice == 1, "risky", "safe")) %>%
+  select(prolific_pid, test_part, choice_label, median_rt) %>%
+  pivot_wider(
+    id_cols = c(prolific_pid, test_part),
+    names_from = choice_label,
+    values_from = median_rt,
+    names_prefix = "median_rt_"
+  ) %>%
+  filter(!is.na(median_rt_risky), !is.na(median_rt_safe))
+
+# ---- compute difference (risky − safe) ----
+rt_diff_risky <- rt_wide_risky %>%
+  transmute(
+    prolific_pid,
+    test_part = factor(test_part,
+                       levels = c("Gain", "Loss"),
+                       labels = c("Gains", "Losses")),
+    rt_diff = median_rt_risky - median_rt_safe
+  )
+```
+
+```{r rt-risky-sure-tests}
+# ---- one-sample t-tests vs 0 ----
+t_gain_risky <- t.test(
+  rt_diff_risky$rt_diff[rt_diff_risky$test_part == "Gains"],
+  mu = 0
+)
+
+t_loss_risky <- t.test(
+  rt_diff_risky$rt_diff[rt_diff_risky$test_part == "Losses"],
+  mu = 0
+)
+
+# ---- paired t-test between domains ----
+rt_diff_risky_wide <- rt_diff_risky %>%
+  pivot_wider(
+    id_cols = prolific_pid,
+    names_from = test_part,
+    values_from = rt_diff
+  )
+
+t_pair_risky <- t.test(
+  rt_diff_risky_wide$Gains,
+  rt_diff_risky_wide$Losses,
+  paired = TRUE
+)
+
+# ---- tidy table ----
+rt_tests_summary_risky <- bind_rows(
+  tidy(t_gain_risky) %>% mutate(test = "Gains vs 0"),
+  tidy(t_loss_risky) %>% mutate(test = "Losses vs 0"),
+  tidy(t_pair_risky) %>% mutate(test = "Gains vs Losses (paired)")
+) %>%
+  mutate(metric = "Median RT (risky − safe)") %>%
+  select(metric, test, estimate, statistic, parameter, p.value, conf.low, conf.high)
+
+rt_tests_summary_risky %>%
+  kable(digits = 4, caption = "Median RT differences: risky − sure")
+```
+
+```{r rt-risky-sure-plot, fig.width=7, fig.height=5}
+# ---- summary for bars ----
+rt_diff_risky_summary <- rt_diff_risky %>%
+  group_by(test_part) %>%
+  summarise(
+    mean_diff = mean(rt_diff, na.rm = TRUE),
+    se        = sd(rt_diff, na.rm = TRUE) / sqrt(n()),
+    lower     = mean_diff - 1.96 * se,
+    upper     = mean_diff + 1.96 * se,
+    .groups = "drop"
+  )
+
+# ---- stars ----
+stars_gain <- p_to_stars(t_gain_risky$p.value)
+stars_loss <- p_to_stars(t_loss_risky$p.value)
+stars_pair <- p_to_stars(t_pair_risky$p.value)
+
+# vertical spacing
+rng  <- range(rt_diff_risky_summary$lower, rt_diff_risky_summary$upper, na.rm = TRUE)
+span <- diff(rng); if (span == 0) span <- 0.1
+
+y_gain_star <- 4.1
+y_loss_star <- 4.1
+
+bracket_y <- 4.7
+label_y   <- 4.9
+
+pair_label <- stars_pair
+
+# ---- plot ----
+plot_rt_risky <- ggplot() +
+  geom_jitter(
+    data = rt_diff_risky,
+    aes(x = test_part, y = rt_diff),
+    width = 0.10, height = 0,
+    alpha = 0.45, size = 2
+  ) +
+  geom_col(
+    data = rt_diff_risky_summary,
+    aes(x = test_part, y = mean_diff),
+    width = 0.55,
+    fill  = "grey60",
+    color = "black",
+    alpha = 0.45
+  ) +
+  geom_errorbar(
+    data = rt_diff_risky_summary,
+    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    width = 0.12,
+    linewidth = 1
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+
+  geom_text(aes(x = "Gains",  y = y_gain_star, label = stars_gain),
+            vjust = 0, size = 6, fontface = "bold") +
+  geom_text(aes(x = "Losses", y = y_loss_star, label = stars_loss),
+            vjust = 0, size = 6, fontface = "bold") +
+
+  geom_segment(aes(x = 1, xend = 1, y = bracket_y - 0.01*span, yend = bracket_y)) +
+  geom_segment(aes(x = 2, xend = 2, y = bracket_y - 0.01*span, yend = bracket_y)) +
+  geom_segment(aes(x = 1, xend = 2, y = bracket_y,               yend = bracket_y)) +
+  geom_text(aes(x = 1.5, y = label_y, label = pair_label),
+            vjust = 0, size = 5, fontface = "bold") +
+
+  labs(
+    x = "Domain",
+    y = "Median RT difference (risky − safe, s)",
+    title = "Median RT differences for risky vs. safe choices"
+  ) +
+  coord_cartesian(
+    ylim = c(-5,5)
+  ) +
+  theme_pub()
+
+plot_rt_risky
+
+ggsave(
+  filename = "s2_plot_rt_risky.png",
+  plot = plot_rt_risky,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+# Bayesian mixed-effects regression
+
+Bayesian logistic mixed-effects model of choosing the left option, with EV
+and skewness difference covariates and the full complexity x risk (SD) x
+domain interaction (the model reported in Table 2 of the paper).
+
+```{r regression-covariates}
+# Per-option payoff moments (mean, SD, skewness) and their A - B
+# differences, used as regression covariates
+df_test1 <- df_test1 %>%
+  rowwise() %>%
+  mutate(
+    # --- Option A ---
+    mean_A = probA1 * payA1 + probA2 * payA2,
+    var_A  = probA1 * (payA1 - mean_A)^2 + probA2 * (payA2 - mean_A)^2,
+    sd_A   = sqrt(var_A),
+    skew_A = ifelse(sd_A > 0,
+                    (probA1 * (payA1 - mean_A)^3 + probA2 * (payA2 - mean_A)^3) / (sd_A^3),
+                    0),
+
+    # --- Option B ---
+    mean_B = probB1 * payB1 + probB2 * payB2,
+    var_B  = probB1 * (payB1 - mean_B)^2 + probB2 * (payB2 - mean_B)^2,
+    sd_B   = sqrt(var_B),
+    skew_B = ifelse(sd_B > 0,
+                    (probB1 * (payB1 - mean_B)^3 + probB2 * (payB2 - mean_B)^3) / (sd_B^3),
+                    0),
+
+    # --- Skewness difference ---
+    skew_diff = skew_A - skew_B
+  ) %>%
+  ungroup()
+```
+
+```{r regression-fit}
+# prep
+df_test1_fix <- df_test1 %>%
+  mutate(
+    real_response_num = ifelse(response == "f", 1, 0),
+    test_part      = factor(test_part, levels = c("Gain","Loss")),  # domain
+    complexity_left = ifelse(risk_index == 1, ifelse(complexity_option == "A", 1L, 0L), ifelse(complexity_option == "A", 0L, 1L)),
+    SD_diff_numeric = as.numeric(SD_diff_level)*as.numeric(risk_index),
+    EVD_numeric     = as.numeric(EV_diff_level)*as.numeric(risk_index),
+    EVD_z = scale(EVD_numeric, center = TRUE, scale = TRUE)[,1],
+    SD_diff_z = scale(SD_diff_numeric, center = TRUE, scale = TRUE)[,1],
+    skew_diff_z = scale(skew_diff*as.numeric(risk_index), center = TRUE, scale = TRUE)[,1]
+  )
+
+# Bayesian logistic mixed-effects model of choosing the left option (brms).
+# Long-running (4 chains x 4000 iterations; can take tens of minutes).
+# The fitted model is cached to an .rds file: caching only avoids refitting
+# on re-knit and does not affect the estimates (model formula, data, and
+# sampler settings are unchanged). Delete m_brm_study2.rds to force a refit.
+brm_cache_file <- "m_brm_study2.rds"
+
+if (file.exists(brm_cache_file)) {
+  m_all_rs_brm <- readRDS(brm_cache_file)
+} else {
+  m_all_rs_brm <- brm(
+    real_response_num ~
+      EVD_z + skew_diff_z +
+      complexity_left * SD_diff_z * test_part +
+      (1 | prolific_pid),
+    data = df_test1_fix,
+    family = bernoulli(link = "logit"),
+    chains = 4, cores = 4, iter = 4000,
+    control = list(adapt_delta = 0.95, max_treedepth = 12)
+  )
+  saveRDS(m_all_rs_brm, brm_cache_file)
+}
+```
+
+```{r regression-table}
+# effects = "all" also reports the random-effect SDs (the model includes
+# random slopes for complexity, risk, and domain, not only random intercepts)
+model_parameters(m_all_rs_brm, ci = 0.95, effects = "all") %>%
+  kable(digits = 3,
+        caption = "Bayesian logistic mixed-effects regression (Table 2)")
+```
+
+# Subjective ratings
+
+After the choice blocks, participants rated a subset of gambles on perceived
+complexity and value certainty (1-7 Likert scales).
+
+## Cognitive uncertainty (certainty) ratings
+
+```{r certainty-rating-data}
+# ============================================================
+# Prepare data: trial-level cognitive-uncertainty (confidence) ratings by
+# option complexity (simple/complex) and risky/sure status
+# ============================================================
+
+rating <- data_filtered %>%
+  filter(prolific_pid %in% participants_to_keep$prolific_pid) %>%
+  filter(option_complexity %in% c("complex", "simple")) %>%
+  mutate(
+    confidence_rating = confidence_rating + 1,
+    option_risky_level = case_when(
+      option_certainty == "sure" ~ "Sure (100%)",
+      option_certainty == "uncertain" ~ "Risky (<100%)",
+      TRUE ~ option_certainty
+    ),
+    option_risky_level = factor(option_risky_level,
+                                levels = c("Risky (<100%)","Sure (100%)")),
+    option_complexity  = factor(option_complexity,
+                                levels = c("simple","complex"))
+  )
+
+# ============================================================
+# Summary data for bars + CI
+# ============================================================
+
+rating_summary <- rating %>%
+  group_by(test_part, option_complexity, option_risky_level) %>%
+  summarise(
+    mean_certainty = mean(confidence_rating),
+    se = sd(confidence_rating)/sqrt(n()),
+    lower = mean_certainty - 1.96*se,
+    upper = mean_certainty + 1.96*se,
+    .groups = "drop"
+  )
+
+# ============================================================
+# RISKY vs SURE t-tests (per domain × complexity)
+# ============================================================
+
+t_tests_risky_sure <- rating %>%
+  group_by(test_part, option_complexity, subject) %>%
+  summarise(
+    risky  = mean(confidence_rating[option_risky_level == "Risky (<100%)"]),
+    sure   = mean(confidence_rating[option_risky_level == "Sure (100%)"]),
+    .groups="drop"
+  ) %>%
+  group_by(test_part, option_complexity) %>%
+  summarise(
+    t_res = list(t.test(risky, sure, paired = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p = map_dbl(t_res, ~ .x$p.value),
+    stars = p_to_stars(p)
+  )
+
+# Star positions for risky vs sure
+star_positions <- rating_summary %>%
+  group_by(test_part, option_complexity) %>%
+  summarise(
+    y = 6.5,
+    .groups = "drop"
+  ) %>%
+  mutate(x = option_complexity) %>%
+  left_join(t_tests_risky_sure, by = c("test_part","option_complexity"))
+
+# ============================================================
+# SIMPLE vs COMPLEX t-tests (per domain, collapsed risky/sure)
+# ============================================================
+
+t_simple_complex <- rating %>%
+  group_by(test_part, subject) %>%
+  summarise(
+    simple  = mean(confidence_rating[option_complexity == "simple"]),
+    complex = mean(confidence_rating[option_complexity == "complex"]),
+    .groups = "drop"
+  ) %>%
+  group_by(test_part) %>%
+  summarise(
+    t_res = list(t.test(simple, complex, paired = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p = map_dbl(t_res, ~ .x$p.value),
+    stars = p_to_stars(p)
+  )
+```
+
+```{r certainty-rating-tables}
+# ============================================================
+# Risky vs Sure t-tests (simple & complex)
+# ============================================================
+
+t_risky_sure_table <- rating %>%
+  group_by(test_part, option_complexity, subject) %>%
+  summarise(
+    risky  = mean(confidence_rating[option_risky_level == "Risky (<100%)"]),
+    sure   = mean(confidence_rating[option_risky_level == "Sure (100%)"]),
+    .groups="drop"
+  ) %>%
+  group_by(test_part, option_complexity) %>%
+  summarise(
+    t_out = list(t.test(risky, sure, paired = TRUE)),
+    mean_diff = mean(risky - sure),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tidy_res = map(t_out, tidy)
+  ) %>%
+  unnest(tidy_res) %>%
+  mutate(
+    comparison = paste0("Risky vs Sure (", option_complexity, ")"),
+    p_stars = p_to_stars(p.value)
+  ) %>%
+  select(
+    test_part,
+    comparison,
+    mean_diff,
+    t = statistic,
+    df = parameter,
+    p = p.value,
+    p_stars
+  )
+
+# ============================================================
+# Simple vs Complex t-tests (collapsed over risky/sure)
+# ============================================================
+
+t_simple_complex_table <- rating %>%
+  group_by(test_part, subject) %>%
+  summarise(
+    simple  = mean(confidence_rating[option_complexity == "simple"]),
+    complex = mean(confidence_rating[option_complexity == "complex"]),
+    .groups="drop"
+  ) %>%
+  group_by(test_part) %>%
+  summarise(
+    t_out = list(t.test(simple, complex, paired = TRUE)),
+    mean_diff = mean(simple - complex),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tidy_res = map(t_out, tidy)
+  ) %>%
+  unnest(tidy_res) %>%
+  mutate(
+    comparison = "Simple vs Complex",
+    p_stars = p_to_stars(p.value)
+  ) %>%
+  select(
+    test_part,
+    comparison,
+    mean_diff,
+    t = statistic,
+    df = parameter,
+    p = p.value,
+    p_stars
+  )
+
+# ============================================================
+# Combine all tests in one table
+# ============================================================
+
+t_summary_table <- bind_rows(
+  t_risky_sure_table,
+  t_simple_complex_table
+) %>%
+  arrange(test_part, comparison)  %>%
+  mutate(table_label = "Certainty rating t-test summary")
+
+t_summary_table %>%
+  kable(digits = 4, caption = "Certainty rating t-tests")
+```
+
+```{r certainty-rating-plot, fig.width=7, fig.height=5}
+# ============================================================
+# 1. Define Bracket Positions for Simple vs Complex
+# ============================================================
+
+# Define the height for the brackets (slightly above the data)
+bracket_y <- 7
+tick_height <- 0.2
+
+# Star labels and positions (centered between 1 and 2)
+star_positions_sc <- rating_summary %>%
+  group_by(test_part) %>%
+  summarise(
+    y = bracket_y + 0.3, # Star sits slightly above the line
+    x = 1.5,             # Midpoint between Simple (1) and Complex (2)
+    .groups="drop"
+  ) %>%
+  left_join(t_simple_complex, by = "test_part")
+
+# Define the line segments for the brackets
+# We need a horizontal line from 1 to 2, and vertical ticks at 1 and 2
+brackets_sc <- rating_summary %>%
+  distinct(test_part) %>%
+  mutate(
+    x_start = 1,
+    x_end = 2,
+    y = bracket_y,
+    y_tick_start = bracket_y - tick_height
+  )
+
+# ============================================================
+# 2. Final plot
+# ============================================================
+
+plot_certainty <- ggplot() +
+
+  # jitter grouped inside dodge
+  geom_point(
+    data = rating,
+    aes(
+      x = option_complexity,
+      y = confidence_rating,
+      color = option_risky_level
+    ),
+    position = position_jitterdodge(dodge.width = 0.6, jitter.width = 0.15),
+    alpha = 0.35,
+    size = 1.7
+  ) +
+
+  # bars
+  geom_col(
+    data = rating_summary,
+    aes(
+      x = option_complexity,
+      y = mean_certainty,
+      fill = option_risky_level
+    ),
+    position = position_dodge(width = 0.6),
+    width = 0.55,
+    color = "black",
+    alpha = 0.45
+  ) +
+
+  # CI
+  geom_errorbar(
+    data = rating_summary,
+    aes(
+      x = option_complexity,
+      ymin = lower, ymax = upper,
+      color = option_risky_level
+    ),
+    width = 0.12,
+    linewidth = 0.9,
+    position = position_dodge(width = 0.6)
+  ) +
+
+  # ------------------------------------------------------------
+  # Significance brackets (Simple vs Complex)
+  # ------------------------------------------------------------
+
+  # Horizontal line
+  geom_segment(
+    data = brackets_sc,
+    aes(x = x_start, xend = x_end, y = y, yend = y),
+    color = "black", linewidth = 0.8
+  ) +
+
+  # Left vertical tick
+  geom_segment(
+    data = brackets_sc,
+    aes(x = x_start, xend = x_start, y = y_tick_start, yend = y+0.03),
+    color = "black", linewidth = 0.8
+  ) +
+
+  # Right vertical tick
+  geom_segment(
+    data = brackets_sc,
+    aes(x = x_end, xend = x_end, y = y_tick_start, yend = y+0.03),
+    color = "black", linewidth = 0.8
+  ) +
+
+  # Stars: Simple vs Complex (Now sitting on the bracket)
+  geom_text(
+    data = star_positions_sc,
+    aes(x = x, y = y, label = stars),
+    size = 6,
+    fontface = "bold"
+  ) +
+
+  # ------------------------------------------------------------
+
+  # Stars: Risky vs Sure (Comparison within complexity level)
+  geom_text(
+    data = star_positions,
+    aes(x = option_complexity, y = 6.2, label = stars), # Adjusted y down slightly to fit under main bracket
+    size = 5,
+    fontface = "italic"
+  ) +
+
+  facet_wrap(~ test_part) +
+  labs(
+    x = "Option complexity",
+    y = "Mean certainty rating",
+    fill = "Lottery type",
+    color = "Lottery type",
+    title = "Cognitive uncertainty ratings across conditions"
+  ) +
+  # Expanded Y limit to make room for the bracket
+  coord_cartesian(ylim = c(1, 7.5)) +
+  theme_pub_top()
+
+plot_certainty
+
+ggsave("s2_plot_certainty_rating_risky_safe.png",
+       plot_certainty, width = 7, height = 5, dpi = 600)
+```
+
+## Perceived complexity ratings
+
+```{r complexity-rating-data}
+# Perceived-complexity ratings, analysed analogously to the certainty
+# ratings above. Ratings are rescaled +1 to the 1-7 scale (a constant
+# shift that does not affect any difference score or test statistic).
+
+rating_cplx <- data_filtered %>%
+  filter(prolific_pid %in% participants_to_keep$prolific_pid) %>%
+  filter(option_complexity %in% c("complex", "simple")) %>%
+  mutate(
+    complexity_rating = complexity_rating + 1,
+    option_risky_level = case_when(
+      option_certainty == "sure" ~ "Sure (100%)",
+      option_certainty == "uncertain" ~ "Risky (<100%)",
+      TRUE ~ option_certainty
+    ),
+    option_risky_level = factor(option_risky_level,
+                                levels = c("Risky (<100%)","Sure (100%)")),
+    option_complexity  = factor(option_complexity,
+                                levels = c("simple","complex"))
+  )
+
+# Group means + 95% CI per domain x complexity x risky/sure
+cplx_summary <- rating_cplx %>%
+  group_by(test_part, option_complexity, option_risky_level) %>%
+  summarise(
+    mean_cplx = mean(complexity_rating),
+    se = sd(complexity_rating)/sqrt(n()),
+    lower = mean_cplx - 1.96*se,
+    upper = mean_cplx + 1.96*se,
+    .groups = "drop"
+  )
+
+# Risky vs Sure paired t-tests (per domain x complexity)
+t_risky_sure_cplx <- rating_cplx %>%
+  group_by(test_part, option_complexity, subject) %>%
+  summarise(
+    risky  = mean(complexity_rating[option_risky_level == "Risky (<100%)"]),
+    sure   = mean(complexity_rating[option_risky_level == "Sure (100%)"]),
+    .groups="drop"
+  ) %>%
+  group_by(test_part, option_complexity) %>%
+  summarise(
+    t_out = list(t.test(risky, sure, paired = TRUE)),
+    mean_diff = mean(risky - sure),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tidy_res = map(t_out, tidy)
+  ) %>%
+  unnest(tidy_res)
+
+# Simple vs Complex paired t-tests (per domain, collapsed over risky/sure)
+t_simple_complex_cplx <- rating_cplx %>%
+  group_by(test_part, subject) %>%
+  summarise(
+    simple  = mean(complexity_rating[option_complexity == "simple"]),
+    complex = mean(complexity_rating[option_complexity == "complex"]),
+    .groups="drop"
+  ) %>%
+  group_by(test_part) %>%
+  summarise(
+    t_out = list(t.test(simple, complex, paired = TRUE)),
+    mean_diff = mean(simple - complex),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tidy_res = map(t_out, tidy)
+  ) %>%
+  unnest(tidy_res) %>%
+  mutate(stars = p_to_stars(p.value))
+
+# Star positions for the risky-vs-sure comparison in the plot
+star_positions_cplx <- cplx_summary %>%
+  distinct(test_part, option_complexity) %>%
+  left_join(
+    t_risky_sure_cplx %>%
+      mutate(stars = p_to_stars(p.value)) %>%
+      select(test_part, option_complexity, stars),
+    by = c("test_part", "option_complexity")
+  ) %>%
+  mutate(y = 6.0)
+```
+
+```{r complexity-rating-tables}
+# TABLE: Risky vs Sure + Simple vs Complex
+
+t_risky_sure_table_cplx <- t_risky_sure_cplx %>%
+  mutate(
+    comparison = paste0("Risky vs Sure (", option_complexity, ")"),
+    p_stars = p_to_stars(p.value)
+  ) %>%
+  select(test_part, comparison, mean_diff, statistic, parameter, p.value, p_stars)
+
+t_simple_complex_table_cplx <- t_simple_complex_cplx %>%
+  mutate(
+    comparison = "Simple vs Complex",
+    p_stars = p_to_stars(p.value)
+  ) %>%
+  select(test_part, comparison, mean_diff, statistic, parameter, p.value, p_stars)
+
+complexity_t_summary_table <- bind_rows(
+  t_risky_sure_table_cplx,
+  t_simple_complex_table_cplx
+) %>%
+  arrange(test_part, comparison) %>%
+  mutate(table_label = "Complexity rating t-test summary")
+
+complexity_t_summary_table %>%
+  kable(digits = 4, caption = "Complexity rating t-tests")
+```
+
+```{r complexity-rating-plot, fig.width=7, fig.height=5}
+# ============================================================
+# 1. Define Bracket Positions for Simple vs Complex
+# ============================================================
+
+# Define height for the brackets (needs to be high enough to clear the 'Complex' bars)
+bracket_y_cplx <- 6.5
+tick_height <- 0.2
+
+# Update star positions to sit on the bracket
+star_positions_sc_cplx <- cplx_summary %>%
+  group_by(test_part) %>%
+  summarise(
+    y = bracket_y_cplx + 0.3,
+    x = 1.5,
+    .groups="drop"
+  ) %>%
+  left_join(t_simple_complex_cplx, by = "test_part")
+
+# Define the line segments for the brackets
+brackets_sc_cplx <- cplx_summary %>%
+  distinct(test_part) %>%
+  mutate(
+    x_start = 1,
+    x_end = 2,
+    y = bracket_y_cplx,
+    y_tick_start = bracket_y_cplx - tick_height
+  )
+
+# ============================================================
+# 2. Final Plot
+# ============================================================
+
+plot_complexity <- ggplot() +
+
+  # Data points (jittered)
+  geom_point(
+    data = rating_cplx,
+    aes(x = option_complexity, y = complexity_rating,
+        color = option_risky_level),
+    position = position_jitterdodge(dodge.width = 0.6, jitter.width = 0.15),
+    alpha = 0.35,
+    size = 1.7
+  ) +
+
+  # Bars
+  geom_col(
+    data = cplx_summary,
+    aes(x = option_complexity, y = mean_cplx, fill = option_risky_level),
+    position = position_dodge(width = 0.6),
+    width = 0.55,
+    color = "black",
+    alpha = 0.45
+  ) +
+
+  # Error bars
+  geom_errorbar(
+    data = cplx_summary,
+    aes(x = option_complexity, ymin = lower, ymax = upper,
+        color = option_risky_level),
+    position = position_dodge(width = 0.6),
+    width = 0.12,
+    linewidth = 0.9
+  ) +
+
+  # ------------------------------------------------------------
+  # Significance brackets (Simple vs Complex)
+  # ------------------------------------------------------------
+
+  # Horizontal line
+  geom_segment(
+    data = brackets_sc_cplx,
+    aes(x = x_start, xend = x_end, y = y, yend = y),
+    color = "black", linewidth = 0.8
+  ) +
+
+  # Left vertical tick
+  geom_segment(
+    data = brackets_sc_cplx,
+    aes(x = x_start, xend = x_start, y = y_tick_start, yend = y+0.03),
+    color = "black", linewidth = 0.8
+  ) +
+
+  # Right vertical tick
+  geom_segment(
+    data = brackets_sc_cplx,
+    aes(x = x_end, xend = x_end, y = y_tick_start, yend = y+0.03),
+    color = "black", linewidth = 0.8
+  ) +
+
+  # Stars: Simple vs Complex (Now sitting on the bracket)
+  geom_text(
+    data = star_positions_sc_cplx,
+    aes(x = x, y = y, label = stars),
+    size = 6,
+    fontface = "bold"
+  ) +
+
+  # ------------------------------------------------------------
+
+  # Stars: Risky vs Sure (Comparison within complexity level)
+  # Ensure these don't overlap with the bracket; adjusted y position if needed
+  geom_text(
+    data = star_positions_cplx,
+    aes(x = option_complexity, y = y, label = stars),
+    size = 5,
+    fontface = "italic"
+  ) +
+
+  facet_wrap(~ test_part) +
+  labs(
+    x = "Option complexity",
+    y = "Mean complexity rating",
+    fill = "Lottery type",
+    color = "Lottery type",
+    title = "Complexity ratings across conditions"
+  ) +
+  # Expanded Y limit to accommodate the higher bracket
+  coord_cartesian(ylim = c(1, 7)) +
+  theme_pub_top()
+
+plot_complexity
+
+ggsave("s2_plot_complexity_rating_risky_safe.png",
+       plot_complexity, width = 7, height = 5, dpi = 600)
+```
+
+## Rating differences and complex-option choice
+
+Spearman correlations assess (a) the association between rating difference
+scores (complex - simple) for perceived complexity and the proportion of
+complex choices, and (b) the association between rating difference scores
+for cognitive uncertainty (complex - simple) and the proportion of complex
+choices, separately for gains and losses. The gain-domain panel is reported
+in the main text; the loss-domain panel is an Appendix A output.
+
+```{r rating-diff-scores}
+rating <- data_filtered %>%
+  filter(prolific_pid %in% participants_to_keep$prolific_pid) %>%
+  filter(option_complexity %in% c("complex", "simple")) %>%
+  mutate(certainty_rating = confidence_rating)
+
+rating_complex_summary <- rating %>%
+  group_by(prolific_pid, option_complexity) %>%
+  summarise(
+    mean_complex_rating = mean(complexity_rating, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+rating_certainty_summary <- rating %>%
+  group_by(prolific_pid, option_complexity) %>%
+  summarise(
+    mean_certainty_rating = mean(certainty_rating, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Prepare diff scores ---
+rating_complex_diff <- rating_complex_summary %>%
+  pivot_wider(
+    id_cols = prolific_pid,
+    names_from = option_complexity,
+    values_from = mean_complex_rating
+  ) %>%
+  mutate(diff_complexity = complex - simple) %>%
+  select(prolific_pid, diff_complexity)
+
+# Cognitive uncertainty = reversed certainty, hence the sign flip
+rating_certainty_diff <- rating_certainty_summary %>%
+  pivot_wider(
+    id_cols = prolific_pid,
+    names_from = option_complexity,
+    values_from = mean_certainty_rating
+  ) %>%
+  mutate(diff_certainty = (complex - simple) * -1) %>%
+  select(prolific_pid, diff_certainty)
+
+# --- Join with complex-choice proportions ---
+joined_corr_df <- complex_choice_summary_individual %>%
+  left_join(rating_complex_diff,  by = "prolific_pid") %>%
+  left_join(rating_certainty_diff, by = "prolific_pid") %>%
+  mutate(test_part = factor(test_part, levels = c("Gain", "Loss")))
+```
+
+```{r rating-diff-choice-correlations}
+# Correlation summary table (the same Spearman tests that are annotated in
+# the panels below)
+corr_rating_choice <- joined_corr_df %>%
+  group_by(test_part) %>%
+  summarise(
+    `Perceived complexity` = list(tidy(
+      cor.test(diff_complexity, prop_complex, method = "spearman"))),
+    `Cognitive uncertainty` = list(tidy(
+      cor.test(diff_certainty, prop_complex, method = "spearman"))),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(`Perceived complexity`, `Cognitive uncertainty`),
+    names_to = "predictor",
+    values_to = "res"
+  ) %>%
+  unnest(res) %>%
+  mutate(stars = p_to_stars(p.value)) %>%
+  select(test_part, predictor, estimate, statistic, p.value, stars)
+
+corr_rating_choice %>%
+  kable(digits = 4,
+        caption = "Spearman correlations: rating difference (complex − simple) vs complex-choice proportion (Gain = main text; Loss = Appendix A)")
+```
+
+```{r rating-diff-choice-plots, fig.width=7, fig.height=5}
+# =========================================================
+# FUNCTION: build one plot for a given domain (Gain or Loss)
+# =========================================================
+make_corr_plot_for_domain <- function(domain_label, df) {
+
+  df_domain <- df %>% filter(test_part == domain_label)
+
+  # 1) correlations for this domain
+  corr_complexity <- df_domain %>%
+    summarise(res = list(cor.test(diff_complexity, prop_complex, method = "spearman"))) %>%
+    mutate(tidy = map(res, tidy)) %>%
+    unnest(tidy) %>%
+    mutate(predictor = "Perceived complexity")
+
+  corr_certainty <- df_domain %>%
+    summarise(res = list(cor.test(diff_certainty, prop_complex, method = "spearman"))) %>%
+    mutate(tidy = map(res, tidy)) %>%
+    unnest(tidy) %>%
+    mutate(predictor = "Cognitive uncertainty")
+
+  corr_all <- bind_rows(corr_complexity, corr_certainty) %>%
+    select(predictor, estimate, p.value) %>%
+    mutate(
+      stars = p_to_stars(p.value),
+      label = paste0("ρ = ", round(estimate, 2), " ", stars)
+    )
+
+  # 2) long df for plotting
+  plot_df <- df_domain %>%
+    select(prolific_pid, prop_complex, diff_complexity, diff_certainty) %>%
+    pivot_longer(
+      cols = c(diff_complexity, diff_certainty),
+      names_to = "predictor",
+      values_to = "diff_score"
+    ) %>%
+    mutate(
+      predictor = recode(
+        predictor,
+        diff_complexity = "Perceived complexity",
+        diff_certainty  = "Cognitive uncertainty"
+      )
+    )
+
+  plot_df$predictor <- factor(
+    plot_df$predictor,
+    levels = c("Perceived complexity", "Cognitive uncertainty")
+  )
+  corr_all$predictor <- factor(corr_all$predictor, levels = levels(plot_df$predictor))
+
+  # 3) plot (2×1 panel)
+  ggplot(plot_df, aes(x = diff_score, y = prop_complex)) +
+    geom_point(alpha = 0.55) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 1) +
+    facet_grid(predictor ~ .) +
+    geom_text(
+      data = corr_all,
+      aes(x = -Inf, y = Inf, label = label),
+      hjust = -0.05, vjust = 1.1, size = 7, fontface = "bold"
+    ) +
+    labs(
+      x = "Rating difference (complex – simple)",
+      y = "Proportion choosing complex option",
+      title = paste0("Correlations between rating diff and complex choices (", domain_label, ")")
+    ) +
+    theme_pub()
+}
+
+# =========================================================
+# MAKE TWO SEPARATE PLOTS (Gain = main text; Loss = Appendix A)
+# =========================================================
+plot_gain <- make_corr_plot_for_domain("Gain", joined_corr_df)
+plot_loss <- make_corr_plot_for_domain("Loss", joined_corr_df)
+
+plot_gain
+plot_loss
+
+# =========================================================
+# SAVE
+# =========================================================
+ggsave(
+  filename = "s2_plot_corr_rating_diff_complex_gain.png",
+  plot = plot_gain,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 600
+)
+
+ggsave(
+  filename = "s2_plot_corr_rating_diff_complex_loss.png",
+  plot = plot_loss,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 600
+)
+```
+
+# Cognitive-ability correlations
+
+Cognitive ability (CA) is the mean accuracy across the Berlin Numeracy Test
+(BNT) and the Health & Medical Test (HMT). Spearman correlations relate CA
+to complex-option choice and to EV-consistent choice, per domain. The
+loss-domain CA plot is an Appendix A output.
+
+```{r cognitive-ability-scores}
+# Cognitive-ability score per participant: mean accuracy across the two
+# tasks (BNT and HMT)
+result_ca <- data %>%
+  group_by(prolific_pid) %>%
+  dplyr::summarize(
+    accuracy_BNT = mean(accuracy_BNT, na.rm = TRUE),
+    accuracy_HMT = mean(accuracy_HMT, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = c(accuracy_BNT, accuracy_HMT), names_to = "accuracy_type", values_to = "score")
+
+result_ca <- result_ca %>%
+  group_by(prolific_pid) %>%
+  dplyr::summarize(ca_results = mean(score, na.rm = TRUE))
+```
+
+## CA and complex-option choice
+
+```{r ca-complex-choice, fig.width=7, fig.height=5}
+# --- join data ---
+joined_df <- inner_join(result_ca, complex_choice_summary_individual,
+                        by = "prolific_pid") %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  mutate(test_part = factor(test_part, levels = c("Gain", "Loss")))
+
+# =========================================================
+# FUNCTION: build one plot for a given domain (Gain or Loss)
+# =========================================================
+make_ca_corr_plot_for_domain <- function(domain_label, df) {
+
+  df_domain <- df %>% filter(test_part == domain_label)
+
+  # Spearman correlation (for annotation + table output)
+  corr_res <- tidy(cor.test(df_domain$ca_results, df_domain$prop_complex, method = "spearman")) %>%
+    mutate(
+      test_part = domain_label,
+      table_label = "CA correlation with complex choice",
+      stars = p_to_stars(p.value),
+      label = paste0("ρ = ", sprintf("%.2f", estimate), "  ", stars)
+    )
+
+  # plot
+  p <- ggplot(df_domain, aes(x = ca_results, y = prop_complex)) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+    geom_text(
+      data = corr_res,
+      aes(x = -Inf, y = Inf, label = label),
+      hjust = -0.05, vjust = 1.1,
+      size = 7, fontface = "bold",
+      inherit.aes = FALSE
+    ) +
+    labs(
+      x = "CA performance",
+      y = "Proportion of complex choices",
+      title = paste0("Correlation between CA and complex choice (", domain_label, ")")
+    ) +
+    theme_pub(base_size = 14)
+
+  list(plot = p, corr = corr_res)
+}
+
+# =========================================================
+# MAKE TWO SEPARATE PLOTS + RESULTS
+# =========================================================
+out_gain <- make_ca_corr_plot_for_domain("Gain", joined_df)
+out_loss <- make_ca_corr_plot_for_domain("Loss", joined_df)
+
+plot_ca_corr_gain <- out_gain$plot
+plot_ca_corr_loss <- out_loss$plot
+
+corr_results_gain <- out_gain$corr
+corr_results_loss <- out_loss$corr
+corr_results <- bind_rows(corr_results_gain, corr_results_loss)
+
+corr_results %>%
+  select(test_part, table_label, estimate, statistic, p.value, stars) %>%
+  kable(digits = 4,
+        caption = "Spearman correlations: CA vs complex-choice proportion (Loss = Appendix A)")
+
+plot_ca_corr_gain
+plot_ca_corr_loss
+
+# =========================================================
+# SAVE (gain = manuscript figure panel; loss = Appendix A)
+# =========================================================
+ggsave(
+  filename = "s2_plot_ca_corr_gain.png",
+  plot = plot_ca_corr_gain,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 600
+)
+
+ggsave(
+  filename = "s2_plot_ca_corr_loss.png",
+  plot = plot_ca_corr_loss,
+  width = 7,
+  height = 5.0,
+  units = "in",
+  dpi = 600
+)
+```
+
+## CA and EV-consistent choice
+
+```{r ca-ev-consistency}
+# --- 1. Compute EV-consistent choice per trial ---
+df_ev <- df_test1 %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  filter(EV_diff_level != 0) %>%              # ignore EV=0 trials
+  mutate(
+    domain = factor(ifelse(test_part == "Gain", "Gains", "Losses"),
+                    levels = c("Gains", "Losses")),
+
+    # which option has higher EV?
+    higher_EV_option = ifelse(EV_diff_level > 0, "A", "B"),
+
+    # chosen option (f = left/A, j = right/B)
+    chosen_option = ifelse(real_response == "f", "A", "B"),
+
+    # EV-consistent = chose higher EV option
+    ev_consistent = ifelse(chosen_option == higher_EV_option, 1, 0)
+  )
+
+
+# --- 2. Proportion per participant × domain ---
+ev_consistency_individual <- df_ev %>%
+  group_by(prolific_pid, domain) %>%
+  summarise(
+    prop_ev_consistent = mean(ev_consistent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# --- 3. Join with CA scores ---
+joined_ev <- inner_join(result_ca, ev_consistency_individual, by = "prolific_pid")
+
+
+# --- 4. Spearman correlations separately for Gains and Losses ---
+corr_ev_results <- joined_ev %>%
+  group_by(domain) %>%
+  summarise(
+    cor_test = list(tidy(cor.test(ca_results,
+                                  prop_ev_consistent,
+                                  method = "spearman"))),
+    .groups = "drop"
+  ) %>%
+  unnest(cor_test) %>%
+  mutate(table_label = "CA correlation with EV-consistent choice")
+
+corr_ev_results %>%
+  kable(digits = 4,
+        caption = "Spearman correlations: CA vs EV-consistent choice proportion")
+
+# Descriptive check (mean EV-consistency per domain); not a reported
+# statistic in the paper — retained for reference
+ev_consistency_individual %>%
+  group_by(domain) %>%
+  summarise(mean_prop_ev_consistent = mean(prop_ev_consistent)) %>%
+  kable(digits = 4, caption = "Mean EV-consistent choice proportion by domain")
+```
+
+```{r ca-ev-consistency-plot, fig.width=7, fig.height=5}
+# add stars and clean label formatting
+label_df_ev <- corr_ev_results %>%
+  mutate(
+    stars = p_to_stars(p.value),
+    label = paste0("ρ = ",
+                   sprintf("%.2f", estimate),
+                   "  ", stars)
+  )
+
+# --- APA-style plot with stars ---
+plot_ev_corr <- ggplot(joined_ev,
+                       aes(x = ca_results, y = prop_ev_consistent)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = T, linewidth = 0.8) +
+  facet_wrap(~ domain) +
+  geom_text(data = label_df_ev,
+            aes(label = label),
+            x = -Inf, y = Inf,
+            hjust = -0.05, vjust = 1.1,
+            size = 7,
+            fontface = "bold") +
+  labs(
+    x = "CA performance",
+    y = "Proportion of EV-consistent choices",
+    title = "Correlation between CA and EV-consistent choice proportion"
+  ) +
+  theme_pub(base_size = 14)
+
+plot_ev_corr
+
+ggsave(
+  filename = "s2_plot_ev_corr.png",
+  plot = plot_ev_corr,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+# High-EV-difference trial accuracy
+
+Catch trials had a large EV difference (+/- 70); accuracy is the proportion
+choosing the EV-better option (choice rule reversed in the loss domain).
+
+```{r catch-accuracy-data}
+# Catch trials: large EV difference (+/- 70). Accuracy = choosing the
+# EV-better option (choice rule reversed in the loss domain)
+df_test2 <- cleaned_RT_data %>%
+  filter(trial_type_label == "test" & skew == "catch")
+
+df_test2 <- df_test2 %>%
+  mutate(
+    real_response = case_when(
+      risk_index == 1  & response == "f" ~ "f",
+      risk_index == 1  & response == "j" ~ "j",
+      risk_index == -1 & response == "f" ~ "j",
+      risk_index == -1 & response == "j" ~ "f"
+    ),
+    good_decision = case_when(
+      # --- Gain_Catch: same rule as before ---
+      test_part == "Gain_Catch" & EV_diff_level == 70  & real_response == "f" ~ 1,
+      test_part == "Gain_Catch" & EV_diff_level == -70 & real_response == "j" ~ 1,
+
+      # --- Loss_Catch: reverse rule ---
+      test_part == "Loss_Catch" & EV_diff_level == 70  & real_response == "j" ~ 1,
+      test_part == "Loss_Catch" & EV_diff_level == -70 & real_response == "f" ~ 1,
+
+      TRUE ~ 0
+    )
+  )
+
+catch_accuracy_individual <- df_test2 %>%
+  group_by(prolific_pid, test_part) %>%
+  summarise(
+    n_trials = n(),
+    prop_catch_accuracy = mean(good_decision),
+    .groups = "drop"
+  )
+
+catch_accuracy_group <-  catch_accuracy_individual %>%
+  group_by(test_part) %>%
+  summarise(
+    mean_catch_prop = mean(prop_catch_accuracy, na.rm = TRUE),
+    se = sd(prop_catch_accuracy, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  mutate(
+    lower = mean_catch_prop - 1.96 * se,
+    upper = mean_catch_prop + 1.96 * se
+  )
+
+catch_accuracy_group %>%
+  kable(digits = 4, caption = "High-EV-difference trial accuracy by domain")
+```
+
+```{r catch-accuracy-tests}
+# ---------- One-sample (vs .5) and paired t-tests ----------
+t_catch_gain <- t.test(
+  catch_accuracy_individual$prop_catch_accuracy[
+    catch_accuracy_individual$test_part == "Gain_Catch"
+  ],
+  mu = 0.5, alternative = "two.sided"
+)
+
+t_catch_loss <- t.test(
+  catch_accuracy_individual$prop_catch_accuracy[
+    catch_accuracy_individual$test_part == "Loss_Catch"
+  ],
+  mu = 0.5, alternative = "two.sided"
+)
+
+# Paired: same participants in Gain & Loss
+catch_wide <- catch_accuracy_individual %>%
+  pivot_wider(
+    id_cols    = prolific_pid,
+    names_from = test_part,
+    values_from = prop_catch_accuracy
+  )
+
+t_catch_gain_vs_loss <- t.test(
+  catch_wide$Gain_Catch, catch_wide$Loss_Catch,
+  paired = TRUE, alternative = "two.sided"
+)
+
+# Summary table
+t_summary_catch <- bind_rows(
+  tidy(t_catch_gain)         %>% mutate(test = "Gain vs 0.5"),
+  tidy(t_catch_loss)         %>% mutate(test = "Loss vs 0.5"),
+  tidy(t_catch_gain_vs_loss) %>% mutate(test = "Gain vs Loss (paired)")
+) %>%
+  select(test, estimate, statistic, parameter, p.value, conf.low, conf.high)
+
+t_summary_catch %>%
+  kable(digits = 4, caption = "High-EV-difference trial accuracy t-tests")
+```
+
+```{r catch-accuracy-plot, fig.width=7, fig.height=5}
+stars_gain <- p_to_stars(t_catch_gain$p.value)
+stars_loss <- p_to_stars(t_catch_loss$p.value)
+stars_pair <- p_to_stars(t_catch_gain_vs_loss$p.value)
+
+# ---------- Prepare data for plotting ----------
+plot_pts <- catch_accuracy_individual %>%
+  mutate(
+    test_part = factor(
+      test_part,
+      levels = c("Gain_Catch", "Loss_Catch"),
+      labels = c("Gains", "Losses")
+    )
+  )
+
+plot_bars <- catch_accuracy_group %>%
+  mutate(
+    test_part = factor(
+      test_part,
+      levels = c("Gain_Catch", "Loss_Catch"),
+      labels = c("Gains", "Losses")
+    )
+  )
+
+# fixed vertical positions (all stars above the dots)
+y_gain_star <- 1.02
+y_loss_star <- 1.02
+bracket_y   <- 1.04
+label_y     <- 1.045
+
+# ---------- Plot ----------
+plot_catch_accuracy <- ggplot() +
+  # individual participants
+  geom_jitter(
+    data = plot_pts,
+    aes(x = test_part, y = prop_catch_accuracy),
+    width = 0.10, height = 0,
+    alpha = 0.45, size = 2
+  ) +
+  # group mean bars (semi-transparent)
+  geom_col(
+    data = plot_bars,
+    aes(x = test_part, y = mean_catch_prop),
+    width = 0.55,
+    fill  = "grey60",
+    color = "black",
+    alpha = 0.45
+  ) +
+  # 95% CI (bold)
+  geom_errorbar(
+    data = plot_bars,
+    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    width = 0.12,
+    linewidth = 0.9
+  ) +
+  # chance line at 0.5
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  # one-sample stars above each bar
+  geom_text(
+    aes(x = "Gains",  y = y_gain_star, label = stars_gain),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  geom_text(
+    aes(x = "Losses", y = y_loss_star, label = stars_loss),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  # bracket + star for paired Gain vs Loss
+  geom_segment(aes(x = 1, xend = 1, y = bracket_y - 0.01, yend = bracket_y)) +
+  geom_segment(aes(x = 2, xend = 2, y = bracket_y - 0.01, yend = bracket_y)) +
+  geom_segment(aes(x = 1, xend = 2, y = bracket_y,       yend = bracket_y)) +
+  geom_text(
+    aes(x = 1.5, y = label_y, label = stars_pair),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1.1),
+    breaks = seq(0, 1, by = 0.25),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Domain",
+    y = "High EV diff trial accuracy (proportion correct)",
+    title = "High EV diff trial accuracy in gain and loss domains"
+  ) +
+  theme_pub()
+
+plot_catch_accuracy
+
+ggsave(
+  filename = "s2_plot_catch_accuracy.png",
+  plot = plot_catch_accuracy,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+# Appendix B: preregistered complex-role test
+
+Proportion of complex-option choices when the risky vs the sure option is
+the complex one, per domain (figure fig:Preregistered in the paper).
+
+```{r complex-role-data}
+complex_choice_summary_individual2 <- df_test1 %>%
+  mutate(complex_role = ifelse(complexity_option == "A", "Risky option complex", "Sure option complex")) %>%
+  filter(test_part %in% c("Gain", "Loss")) %>%
+  group_by(prolific_pid, test_part, complex_role) %>%
+  summarise(
+    n_trials = n(),
+    n_complex = sum(complex_choice, na.rm = TRUE),
+    prop_complex = mean(complex_choice, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+complex_choice_summary_group2 <-  complex_choice_summary_individual2 %>%
+  group_by(test_part, complex_role) %>%
+  summarise(
+    mean_complex_prop = mean(prop_complex, na.rm = TRUE),
+    se = sd(prop_complex, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  mutate(
+    lower = mean_complex_prop - 1.96 * se,
+    upper = mean_complex_prop + 1.96 * se
+  )
+```
+
+```{r complex-role-plot-data}
+# -------------------------------------------------------------------
+# 1) Prepare plotting data (facet by domain, x = which option is complex)
+# -------------------------------------------------------------------
+plot_df_points <- complex_choice_summary_individual2 %>%
+  mutate(
+    test_part = factor(test_part, levels = c("Gain", "Loss"),
+                       labels = c("Gains", "Losses")),
+    complex_role = factor(
+      complex_role,
+      levels = c("Risky option complex", "Sure option complex")
+    )
+  )
+
+plot_df_bars <- complex_choice_summary_group2 %>%
+  mutate(
+    test_part = factor(test_part, levels = c("Gain", "Loss"),
+                       labels = c("Gains", "Losses")),
+    complex_role = factor(
+      complex_role,
+      levels = c("Risky option complex", "Sure option complex")
+    )
+  )
+
+# -------------------------------------------------------------------
+# 2) One-sample t-tests vs 0.5 (for each domain × role)
+# -------------------------------------------------------------------
+tests_one <- plot_df_points %>%
+  group_by(test_part, complex_role) %>%
+  summarise(
+    p = t.test(prop_complex, mu = 0.5)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stars = p_to_stars(p),
+    x = as.numeric(complex_role),
+    y = 1.01  # position of stars vs 0.5
+  )
+
+# -------------------------------------------------------------------
+# 3) Paired t-tests within domain: risky complex vs sure complex
+# -------------------------------------------------------------------
+paired_tests <- complex_choice_summary_individual2 %>%
+  select(prolific_pid, test_part, complex_role, prop_complex) %>%
+  pivot_wider(
+    names_from  = complex_role,
+    values_from = prop_complex
+  ) %>%
+  mutate(
+    test_part = factor(test_part, levels = c("Gain", "Loss"),
+                       labels = c("Gains", "Losses"))
+  ) %>%
+  group_by(test_part) %>%
+  summarise(
+    p = t.test(`Risky option complex`,
+               `Sure option complex`,
+               paired = TRUE)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stars   = p_to_stars(p),
+    x_start = 1,
+    x_end   = 2,
+    y       = 1.07  # bracket height
+  )
+```
+
+```{r complex-role-tables}
+# ============================================================
+# 1) One-sample t-tests vs 0.5
+# ============================================================
+
+one_sample_results <- plot_df_points %>%
+  group_by(test_part, complex_role) %>%
+  summarise(
+    t_res = list(t.test(prop_complex, mu = 0.5)),
+    mean_prop = mean(prop_complex),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tidy_res = map(t_res, tidy),
+    t = map_dbl(tidy_res, "statistic"),
+    df = map_dbl(tidy_res, "parameter"),
+    p = map_dbl(tidy_res, "p.value"),
+    p_stars = p_to_stars(p),
+    comparison = paste0(complex_role, " vs 0.5")
+  ) %>%
+  select(test_part, comparison, mean_prop, t, df, p, p_stars)
+
+# ============================================================
+# 2) Paired test: Risky option complex vs Sure option complex
+# ============================================================
+
+paired_results <- complex_choice_summary_individual2 %>%
+  select(prolific_pid, test_part, complex_role, prop_complex) %>%
+  pivot_wider(
+    names_from = complex_role,
+    values_from = prop_complex
+  ) %>%
+  mutate(
+    test_part = factor(test_part,
+                       levels = c("Gain","Loss"),
+                       labels = c("Gains","Losses"))
+  ) %>%
+  group_by(test_part) %>%
+  summarise(
+    t_res = list(t.test(`Risky option complex`,
+                        `Sure option complex`,
+                        paired = TRUE)),
+    mean_diff = mean(`Risky option complex` - `Sure option complex`),
+    mean_risky = mean(`Risky option complex`),
+    mean_sure  = mean(`Sure option complex`),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tidy_res = map(t_res, tidy),
+    t = map_dbl(tidy_res, "statistic"),
+    df = map_dbl(tidy_res, "parameter"),
+    p = map_dbl(tidy_res, "p.value"),
+    p_stars = p_to_stars(p),
+    comparison = "Risky complex vs Sure complex"
+  ) %>%
+  select(test_part, comparison,
+         mean_risky, mean_sure, mean_diff,
+         t, df, p, p_stars)
+
+# ============================================================
+# 3) Combine into one summary table
+# ============================================================
+
+complex_choice_test_summary <- bind_rows(
+  one_sample_results,
+  paired_results
+) %>%
+  arrange(test_part, comparison)
+
+complex_choice_test_summary %>%
+  kable(digits = 4,
+        caption = "Complex-option choice by complex-option role (Appendix B)")
+```
+
+```{r complex-role-plot, fig.width=7, fig.height=5}
+pair_label_df <- paired_tests %>%
+  mutate(
+    x = 1.5,
+    y = 1.05  # label height
+  )
+
+# -------------------------------------------------------------------
+# 4) Plot (faceted by domain)
+# -------------------------------------------------------------------
+plot_complex_role <- ggplot() +
+  # individual participants
+  geom_jitter(
+    data = plot_df_points,
+    aes(x = complex_role, y = prop_complex),
+    width = 0.10, height = 0,
+    alpha = 0.45, size = 1.8
+  ) +
+  # mean bars (semi-transparent so dots remain visible)
+  geom_col(
+    data = plot_df_bars,
+    aes(x = complex_role, y = mean_complex_prop, fill = complex_role),
+    width = 0.60,
+    alpha = 0.45,
+    colour = "black"
+  ) +
+  # 95% CI
+  geom_errorbar(
+    data = plot_df_bars,
+    aes(x = complex_role, ymin = lower, ymax = upper, , color = "#b00000"),
+    width = 0.18, linewidth = 1.3
+  ) +
+  # reference line at 0.5
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  # stars for one-sample tests (vs 0.5)
+  geom_text(
+    data = tests_one,
+    aes(x = x, y = y, label = stars),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+
+  geom_segment(
+    data = paired_tests,
+    aes(x = x_start, xend = x_start, y = y - 0.01, yend = y)
+  ) +
+  geom_segment(
+    data = paired_tests,
+    aes(x = x_end, xend = x_end, y = y - 0.01, yend = y)
+  ) +
+  geom_segment(
+    data = paired_tests,
+    aes(x = x_start, xend = x_end, y = y, yend = y)
+  ) +
+  geom_text(
+    data = pair_label_df,
+    aes(x = x, y = y, label = stars),
+    vjust = 0, size = 6, fontface = "bold"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1.12),
+    breaks = seq(0, 1, by = 0.25),
+    expand = c(0, 0)
+  ) +
+  scale_fill_manual(
+    values = c("Risky option complex" = "grey50",
+               "Sure option complex"  = "grey80")
+  ) +
+  labs(
+    x = "Which option is complex",
+    y = "Proportion of choices for complex option",
+    title = "Complex-option choices when risky vs sure option is complex",
+    fill = NULL
+  ) +
+  facet_wrap(~ test_part, nrow = 1) +
+  theme_pub() +
+  theme(legend.position = "none")
+
+plot_complex_role
+
+ggsave(
+  filename = "s2_plot_complex_role.png",
+  plot = plot_complex_role,
+  width = 7,           # in inches
+  height = 5,
+  dpi = 600            # high resolution
+)
+```
+
+# Manuscript figures
+
+Assemble the manuscript summary figures from the panels saved as .png by
+the chunks above. Every panel referenced here is generated earlier in this
+document, so the assemblies work in a single fresh knit.
+(Previously, some assembly variants referenced panels that no chunk saved
+— plot_ca_corr.png, plot_corr_rating_diff_complex.png,
+plot_complexity_rating.png, plot_certainty_rating.png; those superseded
+assemblies were removed and only the reported figures are built here.)
+
+```{r figure-panels}
+# Load saved figure panels for the two manuscript summary figures
+p1  <- ggdraw() + draw_image("s2_plot_complex_choice.png", scale = 1)
+p3  <- ggdraw() + draw_image("s2_plot_risky_choice.png", scale = 1)
+p4  <- ggdraw() + draw_image("s2_plot_rt_median_diff.png", scale = 1)
+p5  <- ggdraw() + draw_image("s2_plot_rt_risky.png", scale = 1)
+p6  <- ggdraw() + draw_image("s2_plot_complexity_rating_risky_safe.png", scale = 1)
+p7  <- ggdraw() + draw_image("s2_plot_certainty_rating_risky_safe.png", scale = 1)
+p8  <- ggdraw() + draw_image("s2_plot_corr_rating_diff_complex_gain.png", scale = 1)
+p9  <- ggdraw() + draw_image("s2_plot_catch_accuracy.png", scale = 1)
+p10 <- ggdraw() + draw_image("s2_plot_ca_corr_gain.png", scale = 1)
+p11 <- ggdraw() + draw_image("s2_plot_ev_corr.png", scale = 1)
+```
+
+```{r figure-summary-1, fig.width=12, fig.height=10}
+summary_analysis1 <- plot_grid(
+  p1, p3, p4, p5,
+
+  labels = c("(a)", "(b)", "(c)", "(d)"),
+  label_size = 18,
+  label_fontface = "bold",
+  ncol = 2,
+  align = "hv"
+)
+
+# Save
+ggsave(
+  "summary_analysis_1_update.png",
+  summary_analysis1,
+  width = 12,
+  height = 10,
+  dpi = 600
+)
+```
+
+```{r figure-summary-2, fig.width=14, fig.height=14}
+summary_analysis2 <- plot_grid(
+  p6, p7,
+  p8, p9, p10, p11,
+  labels = c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)"),
+  label_size = 18,
+  label_fontface = "bold",
+  ncol = 2,
+  align = "hv"
+)
+
+# Save
+ggsave(
+  "summary_analysis_2.png",
+  summary_analysis2,
+  width = 14,
+  height = 14,
+  dpi = 600
+)
+```
