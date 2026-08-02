@@ -16,6 +16,7 @@ Key packages (versions used):
 | ggplot2 | 4.0.2 | figures |
 | cowplot | 1.2.0 | multi-panel summary figures |
 | lme4 | 2.0.1 | frequentist mixed models (checks) |
+| BayesFactor | 0.9.12 | Bayesian one-sample t-tests for the loss-domain null (Appendix A) |
 | brms | 2.23.0 | Bayesian logistic mixed-effects regressions |
 | rstan | 2.32.7 | Stan backend for brms |
 | bayestestR / parameters | 0.17.0 / 0.28.3 | posterior summaries / model tables |
@@ -28,7 +29,7 @@ Install everything with:
 ```r
 install.packages(c(
   "data.table", "R.utils", "dplyr", "tidyr", "purrr", "stringr", "jsonlite",
-  "broom", "ggplot2", "cowplot", "lme4", "brms", "bayestestR", "parameters",
+  "broom", "ggplot2", "cowplot", "lme4", "BayesFactor", "brms", "bayestestR", "parameters",
   "sjPlot", "knitr", "rmarkdown", "quantmod"
 ))
 ```

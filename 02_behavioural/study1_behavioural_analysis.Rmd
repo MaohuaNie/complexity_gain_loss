@@ -478,6 +478,23 @@ kable(
 ```
 
 ```{r}
+# Bayesian one-sample t-test vs 0.5 for the loss-domain complex-choice
+# proportions (Appendix A): quantifies evidence FOR complexity neutrality,
+# which the nonsignificant frequentist test cannot provide.
+library(BayesFactor)
+bf_loss <- ttestBF(
+  complex_choice_summary_individual$prop_complex[
+    complex_choice_summary_individual$test_part == "Loss"],
+  mu = 0.5
+)
+kable(
+  tibble(`BF10` = extractBF(bf_loss)$bf, `BF01` = 1 / extractBF(bf_loss)$bf),
+  digits = 3,
+  caption = "Bayes factors for the loss-domain complex-choice proportion vs 0.5 (default Cauchy prior, r = 0.707)."
+)
+```
+
+```{r}
 # --- Bar + jitter plot with significance stars ---
 stars_gain <- p_to_stars(t_gain$p.value)
 stars_loss <- p_to_stars(t_loss$p.value)
