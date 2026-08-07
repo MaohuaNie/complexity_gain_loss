@@ -1,17 +1,36 @@
-# OS / editor artifacts
-.DS_Store
-.Rhistory
-.RData
-.Rproj.user/
+# Participant identifiers must never enter the repository.
+# The published data files carry anonymised codes (s1_p001 ... s2_p150);
+# the key that maps them back to Prolific IDs is kept outside this folder.
+anonymization_key*
+*prolific_id*
+*_key.csv
 
-# knitting artifacts
-*.html
-!01_experiment/*.html
+# Fitted brms model objects. These are caches: running the notebooks
+# regenerates them. Each is 20-75 MB, well beyond what belongs in a repository.
+*.rds
 
-# notebook outputs (regenerated on knit)
-02_behavioural/*.rds
+# Figures and tables produced by knitting the notebooks. The repository ships
+# the code that makes them, not the output.
 02_behavioural/*.png
 02_behavioural/*.txt
 
-# anonymization keys must never enter the repository
-anonymization_key*
+# Knitted notebooks and their supporting directories.
+# The experiment file is real source, not a knitting artifact, so it stays.
+*.html
+!01_experiment/*.html
+*_files/
+*_cache/
+
+# R session state
+.Rhistory
+.Rapp.history
+.RData
+.Renviron
+.Rproj.user/
+
+# OS and editor artifacts
+.DS_Store
+Thumbs.db
+*~
+.ipynb_checkpoints/
+__pycache__/

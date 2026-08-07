@@ -62,11 +62,110 @@ library(broom)
 library(cowplot)
 library(brms)
 library(parameters)
+
+# Fixes the random jitter used to display individual data points, so the
+# figures are reproducible across runs. Jitter is display-only: it moves
+# points sideways for legibility and affects no reported statistic.
+set.seed(2024)
 ```
 
 ```{r load-data}
 # Load anonymised trial-level data; fread() reads the .gz directly (via R.utils)
 data <- fread("../data/study2/merged_data_study2.csv.gz")
+```
+
+```{r}
+# ============================================================================
+# COLUMN DICTIONARY: merged_data_study2.csv.gz
+#
+# The file is the raw jsPsych/JATOS export, one row per EVENT (instruction
+# screen, comprehension question, choice trial, survey, ...), not one row per
+# choice. Use trial_type_label to select the rows an analysis needs.
+#
+# -- Which rows am I looking at? --------------------------------------------
+# trial_type_label  Event type. One of:
+#                     question       a comprehension-question attempt
+#                     practice       practice choice trial
+#                     test           MAIN CHOICE TRIAL (used in all analyses)
+#                     BNT / BNT_accuracy   Berlin Numeracy Test item / score
+#                     HMT / HMT_accuracy   Hagen Matrices Test item / score
+#                     demo           demographics + free-text feedback survey
+#                     Bonus_decision the trial drawn to determine the bonus
+# test_part         Block. "Gain"/"Loss" are analysed; "Gain_Catch"/"Loss_Catch"
+#                   are the high-EV-difference attention checks (they also
+#                   carry skew == "catch"); "prac_gain"/"prac_loss" are
+#                   practice trials. Only "Gain"/"Loss" rows enter the main
+#                   analyses.
+# trial_type        The jsPsych plugin that produced the row (bookkeeping).
+#
+# -- Timing -----------------------------------------------------------------
+# rt_trial          RESPONSE TIME OF THE CHOICE in ms. This is the RT used in
+#                   all analyses (converted to seconds).
+# rt                jsPsych event RT in ms; empty on test rows, so do NOT use
+#                   it as the choice RT.
+# time_elapsed      Cumulative ms since the session started (used for the
+#                   completion-time descriptive).
+# start_time        Unix timestamp (ms) of the session start.
+#
+# -- The two options on a choice trial --------------------------------------
+# Options are labelled A and B by DESIGN; which one appeared on the left was
+# randomised, so the design labels must be translated into screen sides.
+# Option A is the RISKY option: payA1 with probability probA1; the
+# complementary outcome is 0 and was not displayed (payA2 is therefore 0).
+# Option B is the SURE option: probB1 = 1 with payoff payB1 (probB2, payB2 = 0).
+# probA1, payA1, probA2, payA2   outcome distribution of the risky option
+# probB1, payB1, probB2, payB2   outcome distribution of the sure option
+# complexity_option  Which design option was shown in the complex (arithmetic
+#                    expression) format: "A" or "B".
+# risk_index         Side mapping: 1 = option A on the left (F key),
+#                    -1 = option A on the right (J key). Needed to convert the
+#                    pressed key into the chosen option.
+# response           Key pressed on a choice trial: "f" (left) or "j" (right).
+# test_chosen_option Chosen option in design terms: "optionA"/"optionB".
+# F, J               JSON of the gamble mapped to each response key.
+# optionA_Stimulus, optionB_Stimulus   image files shown for each option.
+#
+# -- Trial design levels ----------------------------------------------------
+# EV_diff_level     Expected-value difference: -10, 0, 10 on main trials;
+#                   +/-70 on the high-EV-difference attention checks.
+# SD_diff_level     Standard-deviation difference between the two options.
+# skew              Skewness of the risky option: "Left-skewed", "Symmetric",
+#                   "Right-skewed", or "catch" for the attention checks.
+#
+# -- Rating phase (after the choice blocks) ---------------------------------
+# One gamble per combination of domain x complexity x riskiness was rated.
+# option_certainty   Rated option was "sure" or "uncertain" (i.e. risky).
+# option_complexity  Rated option was "simple" or "complex".
+# complexity_rating  "How complex do you think this gamble is?" (1-7)
+# confidence_rating  "How certain are you about the actual value of this
+#                    gamble?" (1-7); analysed as cognitive uncertainty.
+# rated_image, rated_filename, source_pair   the stimulus that was rated.
+#
+# -- Cognitive ability ------------------------------------------------------
+# BNT1_answer .. BNT4_answer  responses to the four Berlin Numeracy items
+# accuracy_BNT      Berlin Numeracy Test accuracy in percent (0-100)
+# option            response option chosen on a Hagen Matrices item
+# accuracy_HMT      short Hagen Matrices Test accuracy in percent (0-100)
+# question_order    order in which the two ability tests were administered
+#
+# -- Payment ----------------------------------------------------------------
+# total_bonus       Final bonus in GBP.
+# total_bonus_no_response  Deduction if the bonus trial got no response
+#                   (empty here: this never occurred).
+#
+# -- Participant and session identifiers ------------------------------------
+# prolific_pid      ANONYMISED participant code (s2_p001 ... s2_p150).
+# subject           jsPsych-generated run code.
+# prolific_study_id, prolific_session_id, jatos_study_result_id,
+# jatos_worker_id, source_file   session bookkeeping; identifiers were
+#                   anonymised before publication.
+#
+# -- Browser/environment checks (not analysed) ------------------------------
+# success, timeout, failed_images, failed_audio, failed_video, width, height,
+# webaudio, browser, browser_version, mobile, os, fullscreen, vsync_rate,
+# webcam, microphone, button_pressed, view_history, internal_node_id,
+# trial_index, stimulus, feedback, after_warning
+# ============================================================================
 ```
 
 ```{r helpers}
@@ -142,7 +241,7 @@ data_filtered <- data %>%
 # Keep main test trials (practice excluded), convert RT from ms to seconds,
 # and flag absolute outliers (RT < 1 s or RT > 30 s)
 cleaned_RT_data <- data_filtered %>%
-  filter(trial_type_label == 'test' & test_part != 'prac') %>%
+  filter(trial_type_label == 'test') %>%
   mutate(rt = as.numeric(rt_trial/1000))
 
 cleaned_RT_data <- cleaned_RT_data %>%
@@ -163,7 +262,8 @@ cleaned_RT_data <- cleaned_RT_data %>%
   )
 
 cleaned_RT_data <- cleaned_RT_data %>%
-  filter(!is_outlier2)
+  filter(!is_outlier2) %>%
+  ungroup()
 ```
 
 ```{r min-trials-criterion}
@@ -304,6 +404,7 @@ demo_summary %>%
 ```{r comprehension-attempts}
 cleaned_RT_data %>%
   ungroup() %>%
+  distinct(prolific_pid, attempts_to_pass_four_questions) %>%
   summarise(mean_attempt = mean(attempts_to_pass_four_questions)) %>%
   kable(digits = 2,
         caption = "Mean comprehension-question attempts (final sample)")
@@ -494,7 +595,7 @@ plot_complex_choice <- ggplot() +
     data = plot_df_points,
     aes(x = test_part, y = prop_complex),
     width = 0.10, height = 0,
-    alpha = 0.45, size = 2
+    alpha = 0.30, size = 1.5, color = "grey60"
   ) +
   geom_col(
     data = plot_df_bars,
@@ -506,9 +607,9 @@ plot_complex_choice <- ggplot() +
   ) +
   geom_errorbar(
     data = plot_df_bars,
-    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    aes(x = test_part, ymin = lower, ymax = upper),
     width = 0.15,
-    linewidth = 1.3
+    linewidth = 1.2
 
   ) +
   geom_hline(yintercept = 0.5, linetype = "dashed") +
@@ -535,6 +636,7 @@ plot_complex_choice <- ggplot() +
 plot_complex_choice
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_complex_choice.png",
   plot = plot_complex_choice,
   width = 7,           # in inches
@@ -638,7 +740,7 @@ plot_risky_choice <- ggplot() +
     data = plot_pts_r,
     aes(x = test_part, y = prop_risky),
     width = 0.10, height = 0,
-    alpha = 0.45, size = 2
+    alpha = 0.30, size = 1.5, color = "grey60"
   ) +
   # group mean bars (semi-transparent)
   geom_col(
@@ -652,7 +754,7 @@ plot_risky_choice <- ggplot() +
   # 95% CI
   geom_errorbar(
     data = plot_bars_r,
-    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    aes(x = test_part, ymin = lower, ymax = upper),
     width = 0.12,
     linewidth = 1.2
   ) +
@@ -692,6 +794,7 @@ geom_text(
 plot_risky_choice
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_risky_choice.png",
   plot = plot_risky_choice,
   width = 7,           # in inches
@@ -708,7 +811,7 @@ Per-participant median RT difference (complex-chosen minus simple-chosen
 trials), tested against 0 within each domain and compared between domains.
 
 ```{r rt-complex-simple-tests}
-# ---- per participant × condition × choice (complex vs simple) ----
+# ---- per participant × domain × choice (complex vs simple) ----
 rt_individual <- df_test1 %>%
   filter(test_part %in% c("Gain", "Loss")) %>%
   group_by(prolific_pid, test_part, complex_choice) %>%
@@ -814,7 +917,7 @@ plot_rt_median_diff <- ggplot() +
     data  = rt_diff,
     aes(x = test_part, y = rt_diff),
     width = 0.10, height = 0,
-    alpha = 0.45, size = 2
+    alpha = 0.30, size = 1.5, color = "grey60"
   ) +
   # group mean bars (semi-transparent)
   geom_col(
@@ -828,7 +931,7 @@ plot_rt_median_diff <- ggplot() +
   # 95% CI
   geom_errorbar(
     data = rt_diff_summary,
-    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    aes(x = test_part, ymin = lower, ymax = upper),
     width = 0.12,
     linewidth = 1.2
   ) +
@@ -865,6 +968,7 @@ plot_rt_median_diff <- ggplot() +
 plot_rt_median_diff
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_rt_median_diff.png",
   plot = plot_rt_median_diff,
   width = 7,           # in inches
@@ -876,7 +980,7 @@ ggsave(
 ## Median RT: risky vs sure choices
 
 ```{r rt-risky-sure-data}
-# Recode choice: risky = 1, safe = 0
+# Recode choice: risky = 1, sure = 0
 df_rt_risky <- df_test1 %>%
   filter(test_part %in% c("Gain", "Loss")) %>%
   mutate(
@@ -885,7 +989,7 @@ df_rt_risky <- df_test1 %>%
   ) %>%
   filter(!is.na(risky_choice))
 
-# ---- summarise median RT per participant × domain × risky/safe ----
+# ---- summarise median RT per participant × domain × risky/sure ----
 rt_individual_risky <- df_rt_risky %>%
   group_by(prolific_pid, test_part, risky_choice) %>%
   summarise(
@@ -893,7 +997,7 @@ rt_individual_risky <- df_rt_risky %>%
     .groups = "drop"
   )
 
-# ---- wide format (median_rt_risky vs median_rt_safe) ----
+# ---- wide format (median RT for risky vs sure choices) ----
 rt_wide_risky <- rt_individual_risky %>%
   mutate(choice_label = ifelse(risky_choice == 1, "risky", "safe")) %>%
   select(prolific_pid, test_part, choice_label, median_rt) %>%
@@ -905,7 +1009,7 @@ rt_wide_risky <- rt_individual_risky %>%
   ) %>%
   filter(!is.na(median_rt_risky), !is.na(median_rt_safe))
 
-# ---- compute difference (risky − safe) ----
+# ---- compute difference (risky − sure) ----
 rt_diff_risky <- rt_wide_risky %>%
   transmute(
     prolific_pid,
@@ -990,7 +1094,7 @@ plot_rt_risky <- ggplot() +
     data = rt_diff_risky,
     aes(x = test_part, y = rt_diff),
     width = 0.10, height = 0,
-    alpha = 0.45, size = 2
+    alpha = 0.30, size = 1.5, color = "grey60"
   ) +
   geom_col(
     data = rt_diff_risky_summary,
@@ -1002,9 +1106,9 @@ plot_rt_risky <- ggplot() +
   ) +
   geom_errorbar(
     data = rt_diff_risky_summary,
-    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    aes(x = test_part, ymin = lower, ymax = upper),
     width = 0.12,
-    linewidth = 1
+    linewidth = 1.2
   ) +
   geom_hline(yintercept = 0, linetype = "dashed") +
 
@@ -1032,6 +1136,7 @@ plot_rt_risky <- ggplot() +
 plot_rt_risky
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_rt_risky.png",
   plot = plot_rt_risky,
   width = 7,           # in inches
@@ -1110,14 +1215,87 @@ if (file.exists(brm_cache_file)) {
   )
   saveRDS(m_all_rs_brm, brm_cache_file)
 }
+
+
+# Item identifier: the underlying gamble structure, collapsing the sign-flipped
+# gain and loss versions into one item (27 items in Study 2).
+df_test1_fix <- df_test1_fix %>%
+  mutate(item_id = paste(probA1, abs(payA1), probA2, abs(payA2),
+                         probB1, abs(payB1), probB2, abs(payB2)))
+cat("items:", dplyr::n_distinct(df_test1_fix$item_id), "\n")   # expect 27
+
+# --- Model 2: + by-participant random slopes ---
+if (file.exists("m_brm_study2_rs.rds")) {
+  m_brm_study2_rs <- readRDS("m_brm_study2_rs.rds")
+} else {
+  m_brm_study2_rs <- brm(
+    real_response_num ~
+      EVD_z + skew_diff_z +
+      complexity_left * SD_diff_z * test_part +
+      (1 + complexity_left + SD_diff_z + test_part | prolific_pid),
+    data = df_test1_fix,
+    family = bernoulli(link = "logit"),
+    chains = 4, cores = 4, iter = 4000,
+    control = list(adapt_delta = 0.95, max_treedepth = 12),
+    seed = 1234
+  )
+  saveRDS(m_brm_study2_rs, "m_brm_study2_rs.rds")
+}
+
+# --- Model 3: + by-item random intercepts ---
+if (file.exists("m_brm_study2_rs_item.rds")) {
+  m_brm_study2_rs_item <- readRDS("m_brm_study2_rs_item.rds")
+} else {
+  m_brm_study2_rs_item <- brm(
+    real_response_num ~
+      EVD_z + skew_diff_z +
+      complexity_left * SD_diff_z * test_part +
+      (1 + complexity_left + SD_diff_z + test_part | prolific_pid) +
+      (1 | item_id),
+    data = df_test1_fix,
+    family = bernoulli(link = "logit"),
+    chains = 4, cores = 4, iter = 4000,
+    control = list(adapt_delta = 0.95, max_treedepth = 12),
+    seed = 1234
+  )
+  saveRDS(m_brm_study2_rs_item, "m_brm_study2_rs_item.rds")
+}
+
+
+
+
 ```
 
 ```{r regression-table}
-# effects = "all" also reports the random-effect SDs (the model includes
-# random slopes for complexity, risk, and domain, not only random intercepts)
+# Parameter table reported as Table 2 in the paper.
+# The reported model is m_all_rs_brm, which has by-participant random
+# intercepts only; effects = "all" adds the random-intercept SD row.
 model_parameters(m_all_rs_brm, ci = 0.95, effects = "all") %>%
   kable(digits = 3,
         caption = "Bayesian logistic mixed-effects regression (Table 2)")
+
+# Full model summary, including R-hat and effective sample sizes
+summary(m_all_rs_brm)
+```
+
+## Robustness to the random-effects structure
+
+The two models below repeat the analysis above with a richer random-effects
+structure. They are reported in the appendix; the conclusions do not depend on
+which structure is used.
+
+```{r regression-robustness}
+# By-participant random slopes for complexity, risk, and domain
+model_parameters(m_brm_study2_rs, ci = 0.95, effects = "all") %>%
+  kable(digits = 3, caption = "Random slopes by participant.")
+
+# Random slopes plus crossed by-item random intercepts
+model_parameters(m_brm_study2_rs_item, ci = 0.95, effects = "all") %>%
+  kable(digits = 3, caption = "Random slopes plus by-item random intercepts.")
+
+# Convergence diagnostics for both
+max(brms::rhat(m_brm_study2_rs), na.rm = TRUE)
+max(brms::rhat(m_brm_study2_rs_item), na.rm = TRUE)
 ```
 
 # Subjective ratings
@@ -1374,7 +1552,7 @@ plot_certainty <- ggplot() +
       color = option_risky_level
     ),
     width = 0.12,
-    linewidth = 0.9,
+    linewidth = 1.2,
     position = position_dodge(width = 0.6)
   ) +
 
@@ -1436,7 +1614,9 @@ plot_certainty <- ggplot() +
 plot_certainty
 
 ggsave("s2_plot_certainty_rating_risky_safe.png",
-       plot_certainty, width = 7, height = 5, dpi = 600)
+       plot_certainty, width = 7, height = 5, dpi = 600,
+       bg = "white"
+     )
 ```
 
 ## Perceived complexity ratings
@@ -1614,7 +1794,7 @@ plot_complexity <- ggplot() +
         color = option_risky_level),
     position = position_dodge(width = 0.6),
     width = 0.12,
-    linewidth = 0.9
+    linewidth = 1.2
   ) +
 
   # ------------------------------------------------------------
@@ -1676,7 +1856,9 @@ plot_complexity <- ggplot() +
 plot_complexity
 
 ggsave("s2_plot_complexity_rating_risky_safe.png",
-       plot_complexity, width = 7, height = 5, dpi = 600)
+       plot_complexity, width = 7, height = 5, dpi = 600,
+       bg = "white"
+     )
 ```
 
 ## Rating differences and complex-option choice
@@ -1842,6 +2024,7 @@ plot_loss
 # SAVE
 # =========================================================
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_corr_rating_diff_complex_gain.png",
   plot = plot_gain,
   width = 7,
@@ -1851,6 +2034,7 @@ ggsave(
 )
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_corr_rating_diff_complex_loss.png",
   plot = plot_loss,
   width = 7,
@@ -1863,7 +2047,7 @@ ggsave(
 # Cognitive-ability correlations
 
 Cognitive ability (CA) is the mean accuracy across the Berlin Numeracy Test
-(BNT) and the Health & Medical Test (HMT). Spearman correlations relate CA
+(BNT) and the short version of the Hagen Matrices Test (HMT-S). Spearman correlations relate CA
 to complex-option choice and to EV-consistent choice, per domain. The
 loss-domain CA plot is an Appendix A output.
 
@@ -1954,6 +2138,7 @@ plot_ca_corr_loss
 # SAVE (gain = manuscript figure panel; loss = Appendix A)
 # =========================================================
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_ca_corr_gain.png",
   plot = plot_ca_corr_gain,
   width = 7,
@@ -1963,6 +2148,7 @@ ggsave(
 )
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_ca_corr_loss.png",
   plot = plot_ca_corr_loss,
   width = 7,
@@ -2056,13 +2242,15 @@ plot_ev_corr <- ggplot(joined_ev,
   labs(
     x = "CA performance",
     y = "Proportion of EV-consistent choices",
-    title = "Correlation between CA and EV-consistent choice proportion"
+    # kept short so it is not clipped at the panel edge in the summary figure
+    title = "CA and EV-consistent choices"
   ) +
   theme_pub(base_size = 14)
 
 plot_ev_corr
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_ev_corr.png",
   plot = plot_ev_corr,
   width = 7,           # in inches
@@ -2204,7 +2392,7 @@ plot_catch_accuracy <- ggplot() +
     data = plot_pts,
     aes(x = test_part, y = prop_catch_accuracy),
     width = 0.10, height = 0,
-    alpha = 0.45, size = 2
+    alpha = 0.30, size = 1.5, color = "grey60"
   ) +
   # group mean bars (semi-transparent)
   geom_col(
@@ -2218,9 +2406,9 @@ plot_catch_accuracy <- ggplot() +
   # 95% CI (bold)
   geom_errorbar(
     data = plot_bars,
-    aes(x = test_part, ymin = lower, ymax = upper, color = "#b00000"),
+    aes(x = test_part, ymin = lower, ymax = upper),
     width = 0.12,
-    linewidth = 0.9
+    linewidth = 1.2
   ) +
   # chance line at 0.5
   geom_hline(yintercept = 0.5, linetype = "dashed") +
@@ -2256,6 +2444,7 @@ plot_catch_accuracy <- ggplot() +
 plot_catch_accuracy
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_catch_accuracy.png",
   plot = plot_catch_accuracy,
   width = 7,           # in inches
@@ -2450,7 +2639,7 @@ plot_complex_role <- ggplot() +
     data = plot_df_points,
     aes(x = complex_role, y = prop_complex),
     width = 0.10, height = 0,
-    alpha = 0.45, size = 1.8
+    alpha = 0.30, size = 1.5, color = "grey60"
   ) +
   # mean bars (semi-transparent so dots remain visible)
   geom_col(
@@ -2463,8 +2652,8 @@ plot_complex_role <- ggplot() +
   # 95% CI
   geom_errorbar(
     data = plot_df_bars,
-    aes(x = complex_role, ymin = lower, ymax = upper, , color = "#b00000"),
-    width = 0.18, linewidth = 1.3
+    aes(x = complex_role, ymin = lower, ymax = upper),
+    width = 0.18, linewidth = 1.2
   ) +
   # reference line at 0.5
   geom_hline(yintercept = 0.5, linetype = "dashed") +
@@ -2514,6 +2703,7 @@ plot_complex_role <- ggplot() +
 plot_complex_role
 
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   filename = "s2_plot_complex_role.png",
   plot = plot_complex_role,
   width = 7,           # in inches
@@ -2559,6 +2749,7 @@ summary_analysis1 <- plot_grid(
 
 # Save
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   "summary_analysis_1_update.png",
   summary_analysis1,
   width = 12,
@@ -2580,6 +2771,7 @@ summary_analysis2 <- plot_grid(
 
 # Save
 ggsave(
+  bg = "white",   # opaque background (transparent PNGs can render black)
   "summary_analysis_2.png",
   summary_analysis2,
   width = 14,
